@@ -7,6 +7,16 @@ st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄"
 
 TOLERANCIA_MONTO = 0.01
 
+# IDs y códigos largos: se leen como texto. No son cantidades y, si pandas los
+# interpreta como número, desbordan int64 (rompen Arrow al mostrar la tabla) y
+# pueden perder precisión en el match contra el TXT.
+COLS_TEXTO = {
+    "PPY_external_id": str,
+    "Deuda_PspTin": str,
+    "Deuda_public_id": str,
+    "Deudor_Documento": str,
+}
+
 for k in ["resultado_detalle", "resultado_solo_metabase", "resultado_resumen", "codigo_conciliacion"]:
     if k not in st.session_state:
         st.session_state[k] = None
@@ -191,13 +201,6 @@ with col2:
     st.subheader("GMoney")
     archivo_gmoney = st.file_uploader("Archivo txt GMoney", type=["txt"], key="uploader_gmoney")
 st.divider()
-
-COLS_TEXTO = {
-    "PPY_external_id": str,
-    "Deuda_PspTin": str,
-    "Deuda_public_id": str,
-    "Deudor_Documento": str,
-}
 
 df_metabase = None
 if archivo_metabase:  # lista no vacía
