@@ -192,9 +192,7 @@ with col2:
     archivo_gmoney = st.file_uploader("Archivo txt GMoney", type=["txt"], key="uploader_gmoney")
 st.divider()
 
-df_metabase = None
-if archivo_metabase:
-    df_metabase = pd.concat([pd.read_csv(a) for a in archivo_metabase], ignore_index=True)
+df_metabase = pd.concat([pd.read_csv(a) for a in archivo_metabase], ignore_index=True)
 
 archivos_listos = df_metabase is not None and archivo_gmoney is not None
 
