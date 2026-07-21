@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from io import BytesIO
+import random
 import json
 import re
 
-st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="centered")
+st.set_page_config(page_title="Conciliación Diaria — Local", layout="centered")
 
 TOLERANCIA_MONTO = 0.01
 
@@ -45,10 +47,20 @@ for k, v in _DEFAULTS.items():
 
 
 def generate_session_id():
-    import random
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     rnd = "".join(str(random.randint(0, 9)) for _ in range(6))
     return f"{ts}_{rnd}"
+
+
+def _leer_archivo(archivo):
+    """Lee un CSV o Excel de Metabase a DataFrame crudo (una sola lectura)."""
+    archivo.seek(0)
+    if archivo.name.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(archivo, dtype=COLS_TEXTO)
+    else:
+        df = pd.read_csv(archivo, dtype=COLS_TEXTO, encoding="latin-1")
+    archivo.seek(0)
+    return df
 
 
 def parsear_gmoney_qr(archivo):
@@ -104,11 +116,7 @@ def parsear_gmoney_qr(archivo):
 
 def parsear_gmoney_multiple(archivos):
     """Parsea uno o varios TXT GMoney y los combina en un solo DataFrame."""
-    dfs = []
-    for a in archivos:
-        a.seek(0)
-        dfs.append(parsear_gmoney_qr(a))
-        a.seek(0)
+    dfs = [parsear_gmoney_qr(a) for a in archivos]
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
@@ -130,59 +138,56 @@ def _normalizar_metabase(df):
     return df[[c for c in COLUMNAS_SALIDA if c in df.columns]]
 
 
-def cargar_metabase(archivos):
-    """Acepta CSV o Excel de deudas pagadas; ambos traen las mismas columnas planas."""
-    dfs = []
-    for a in archivos:
-        a.seek(0)
-        if a.name.lower().endswith((".xlsx", ".xls")):
-            df = pd.read_excel(a, dtype=COLS_TEXTO)
-        else:
-            df = pd.read_csv(a, dtype=COLS_TEXTO, encoding="latin-1")
-        a.seek(0)
-        dfs.append(_normalizar_metabase(df))
-    return pd.concat(dfs, ignore_index=True) if dfs else None
-
-
-def detectar_json_anomalos(archivos):
+def procesar_metabase(archivos):
     """
-    Relee la columna PC_OP_metadata y detecta filas cuyo JSON contiene
-    alguna de las claves anómalas (clave, code, reason).
+    Lee cada archivo UNA sola vez y devuelve:
+      - df_metabase: normalizado para conciliar
+      - df_anomalos: filas con metadata JSON anómala (clave/code/reason)
     """
-    frames = []
+    normalizados, anomalos = [], []
     for a in archivos:
-        a.seek(0)
-        if a.name.lower().endswith((".xlsx", ".xls")):
-            df = pd.read_excel(a, dtype={"PPY_external_id": str})
-        else:
-            df = pd.read_csv(a, dtype={"PPY_external_id": str}, encoding="latin-1")
-        a.seek(0)
+        crudo = _leer_archivo(a)
+        normalizados.append(_normalizar_metabase(crudo))
+        anomalos.append(_detectar_anomalos(crudo))
 
-        if "PC_OP_metadata" not in df.columns:
+    df_metabase = pd.concat(normalizados, ignore_index=True) if normalizados else None
+    df_anomalos = (pd.concat(anomalos, ignore_index=True) if anomalos
+                   else pd.DataFrame(columns=["id_operacion", "claves_encontradas", "contenido_json"]))
+    return df_metabase, df_anomalos
+
+
+def _detectar_anomalos(df_crudo):
+    """
+    Detecta filas cuyo PC_OP_metadata contiene claves anómalas.
+    Vectorizado: filtra por texto antes de parsear JSON (solo parsea candidatas).
+    """
+    cols_vacias = ["id_operacion", "claves_encontradas", "contenido_json"]
+    if "PC_OP_metadata" not in df_crudo.columns:
+        return pd.DataFrame(columns=cols_vacias)
+
+    col = df_crudo["PC_OP_metadata"].astype(str)
+    patron = "|".join(CLAVES_ANOMALAS)
+    candidatas = df_crudo[col.str.contains(patron, na=False, regex=True)]
+    if candidatas.empty:
+        return pd.DataFrame(columns=cols_vacias)
+
+    filas = []
+    for _, row in candidatas.iterrows():
+        celda = str(row.get("PC_OP_metadata", "")).strip()
+        if not celda.startswith("{"):
             continue
-
-        detectadas = []
-        for _, row in df.iterrows():
-            celda = str(row.get("PC_OP_metadata", "")).strip()
-            if not celda.startswith("{"):
-                continue
-            try:
-                d = json.loads(celda)
-            except json.JSONDecodeError:
-                continue
-            presentes = CLAVES_ANOMALAS & set(d.keys())
-            if presentes:
-                detectadas.append({
-                    "id_operacion":       str(row.get("PPY_external_id", "")).strip(),
-                    "claves_encontradas": ", ".join(sorted(presentes)),
-                    "contenido_json":     celda,
-                })
-        if detectadas:
-            frames.append(pd.DataFrame(detectadas))
-
-    if not frames:
-        return pd.DataFrame(columns=["id_operacion", "claves_encontradas", "contenido_json"])
-    return pd.concat(frames, ignore_index=True)
+        try:
+            d = json.loads(celda)
+        except json.JSONDecodeError:
+            continue
+        presentes = CLAVES_ANOMALAS & set(d.keys())
+        if presentes:
+            filas.append({
+                "id_operacion":       str(row.get("PPY_external_id", "")).strip(),
+                "claves_encontradas": ", ".join(sorted(presentes)),
+                "contenido_json":     celda,
+            })
+    return pd.DataFrame(filas, columns=cols_vacias)
 
 
 def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
@@ -201,17 +206,16 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
         on="join_key", how="left", suffixes=("_gmoney", "_metabase")
     )
 
-    def _resultado(row):
-        if row["estado_ar"] == "R":
-            return "Rechazada (R)"
-        if pd.isna(row["amount"]):
-            return "A investigar (falta en Metabase)"
-        if abs(row["amount"] - row["monto_gmoney"]) <= tolerancia:
-            return "OK"
-        return "Diferencia de monto"
+    # Clasificación vectorizada (equivalente a la función _resultado fila por fila)
+    cond = [
+        merged["estado_ar"] == "R",
+        merged["amount"].isna(),
+        (merged["amount"] - merged["monto_gmoney"]).abs() <= tolerancia,
+    ]
+    opciones = ["Rechazada (R)", "A investigar (falta en Metabase)", "OK"]
+    merged["resultado"] = np.select(cond, opciones, default="Diferencia de monto")
 
     merged["dif_monto"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
-    merged["resultado"] = merged.apply(_resultado, axis=1)
     merged["tiene_comision"] = merged["comision_gmoney"].fillna(0) > 0
 
     df_detalle = merged.rename(columns={"join_key": "id_operacion", "amount": "monto_metabase"})
@@ -241,18 +245,13 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
         },
         "categorias": {k: int(v) for k, v in por_categoria.items()},
         "solo_metabase": len(df_solo_metabase),
-        "cuadre_txt": {
-            "suma": suma_cat, "total": total_txt, "cuadra": suma_cat == total_txt,
-        },
+        "cuadre_txt": {"suma": suma_cat, "total": total_txt, "cuadra": suma_cat == total_txt},
     }
     return df_detalle, df_solo_metabase, resumen
 
 
 def generar_descarga(df):
-    """
-    Genera bytes de descarga. Intenta Excel (.xlsx); si openpyxl no está
-    disponible, cae a CSV. Devuelve (bytes, extension, mime).
-    """
+    """Genera bytes de descarga en Excel; si openpyxl falla, cae a CSV. -> (bytes, ext, mime)."""
     try:
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -262,6 +261,24 @@ def generar_descarga(df):
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception:
         return (df.to_csv(index=False).encode("utf-8-sig"), "csv", "text/csv")
+
+
+def boton_descarga(df, etiqueta, nombre_base, codigo):
+    """Botón de descarga con formato Excel/CSV automático."""
+    datos, ext, mime = generar_descarga(df)
+    st.download_button(f"{etiqueta} ({ext.upper()})", datos,
+                       file_name=f"{nombre_base}_{codigo}.{ext}", mime=mime)
+
+
+def mostrar_seccion_tabla(df, descripcion, msg_vacio, etiqueta_descarga, nombre_archivo, codigo):
+    """Renderiza una sección estándar: descripción + tabla + descarga, o mensaje si está vacía."""
+    st.write(descripcion)
+    if df is None or df.empty:
+        st.info(msg_vacio)
+        return
+    st.write(f"Total: {len(df)} registros.")
+    st.dataframe(df)
+    boton_descarga(df, etiqueta_descarga, nombre_archivo, codigo)
 
 
 # -----------------------
@@ -282,8 +299,7 @@ archivo_gmoney = st.file_uploader(
 )
 st.divider()
 
-df_metabase = cargar_metabase(archivo_metabase) if archivo_metabase else None
-archivos_listos = df_metabase is not None and bool(archivo_gmoney)
+archivos_listos = bool(archivo_metabase) and bool(archivo_gmoney)
 
 if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
     codigo = generate_session_id()
@@ -294,8 +310,8 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
             st.stop()
 
         with st.spinner("Procesando conciliación..."):
+            df_metabase, json_anom = procesar_metabase(archivo_metabase)
             df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
-            json_anom = detectar_json_anomalos(archivo_metabase)
 
         st.session_state.resultado_detalle       = df_detalle
         st.session_state.resultado_solo_metabase  = df_solo_metabase
@@ -321,92 +337,60 @@ if st.session_state.resultado_detalle is not None:
 
     st.divider()
 
-    # --- Totales de entrada ---
     st.subheader("Totales de entrada")
-    df_entradas = pd.DataFrame(
-        [{"Concepto": k, "Cantidad": v} for k, v in resumen["entradas"].items()]
-    )
-    st.table(df_entradas)
+    st.table(pd.DataFrame([{"Concepto": k, "Cantidad": v} for k, v in resumen["entradas"].items()]))
 
-    # --- Desglose por categoría ---
     st.subheader("Desglose por categoría")
-    df_categorias = pd.DataFrame(
-        [{"Categoría": k, "Operaciones": v} for k, v in resumen["categorias"].items()]
-    )
-    st.table(df_categorias)
-    st.caption(
-        f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']} operaciones."
-    )
+    st.table(pd.DataFrame([{"Categoría": k, "Operaciones": v} for k, v in resumen["categorias"].items()]))
+    st.caption(f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']} operaciones.")
 
-    # --- Verificación de cuadre ---
     st.subheader("Verificación de cuadre")
     cuadre = resumen["cuadre_txt"]
-    df_cuadre = pd.DataFrame([
+    st.table(pd.DataFrame([
         {"Concepto": "Suma de categorías", "Valor": cuadre["suma"]},
         {"Concepto": "Total líneas TXT",   "Valor": cuadre["total"]},
         {"Concepto": "Estado",             "Valor": "Cuadra" if cuadre["cuadra"] else "No cuadra"},
-    ])
-    st.table(df_cuadre)
+    ]))
     if not cuadre["cuadra"]:
         st.error("La suma de categorías no coincide con el total de líneas del TXT. Requiere revisión.")
 
-    # --- Metadata con estructura anómala ---
     st.subheader("Metadata con estructura anómala")
-    st.write("Operaciones cuyo campo PC_OP_metadata contiene las claves 'clave', 'code' o 'reason', "
-             "en lugar de la estructura estándar de una operación QR.")
-    if json_anom is None or json_anom.empty:
-        st.info("No se detectaron registros con metadata anómala.")
-    else:
-        st.write(f"Total: {len(json_anom)} registros.")
-        st.dataframe(json_anom)
-        datos, ext, mime = generar_descarga(json_anom)
-        st.download_button(f"Descargar metadata anómala ({ext.upper()})", datos,
-                           file_name=f"metadata_anomala_{codigo}.{ext}", mime=mime)
+    mostrar_seccion_tabla(
+        json_anom,
+        "Operaciones cuyo campo PC_OP_metadata contiene las claves 'clave', 'code' o 'reason', "
+        "en lugar de la estructura estándar de una operación QR.",
+        "No se detectaron registros con metadata anómala.",
+        "Descargar metadata anómala", "metadata_anomala", codigo,
+    )
 
-    # --- Operaciones a investigar ---
     st.subheader("Operaciones a investigar")
 
-    # Tabla 1: resultado distinto de OK
-    no_ok = df_detalle[
-        df_detalle["resultado"].isin(["A investigar (falta en Metabase)", "Diferencia de monto"])
-    ]
+    no_ok = df_detalle[df_detalle["resultado"].isin(
+        ["A investigar (falta en Metabase)", "Diferencia de monto"])]
     st.markdown("**Operaciones con incidencia (resultado distinto de OK)**")
-    st.write("Operaciones aprobadas que faltan en Metabase o tienen monto principal distinto.")
-    if no_ok.empty:
-        st.info("No se identificaron operaciones con incidencia.")
-    else:
-        st.write(f"Total: {len(no_ok)} operaciones.")
-        st.dataframe(no_ok)
-        datos, ext, mime = generar_descarga(no_ok)
-        st.download_button(f"Descargar operaciones con incidencia ({ext.upper()})", datos,
-                           file_name=f"incidencias_{codigo}.{ext}", mime=mime)
+    mostrar_seccion_tabla(
+        no_ok,
+        "Operaciones aprobadas que faltan en Metabase o tienen monto principal distinto.",
+        "No se identificaron operaciones con incidencia.",
+        "Descargar operaciones con incidencia", "incidencias", codigo,
+    )
 
-    # Tabla 2: OK con comisión
-    ok_comision = df_detalle[
-        (df_detalle["resultado"] == "OK") & (df_detalle["tiene_comision"])
-    ]
+    ok_comision = df_detalle[(df_detalle["resultado"] == "OK") & (df_detalle["tiene_comision"])]
     st.markdown("**Operaciones OK con comisión**")
-    st.write("Operaciones conciliadas correctamente pero con comisión mayor a cero.")
-    if ok_comision.empty:
-        st.info("No hay operaciones OK con comisión.")
-    else:
-        st.write(f"Total: {len(ok_comision)} operaciones.")
-        st.dataframe(ok_comision)
-        datos, ext, mime = generar_descarga(ok_comision)
-        st.download_button(f"Descargar OK con comisión ({ext.upper()})", datos,
-                           file_name=f"ok_con_comision_{codigo}.{ext}", mime=mime)
+    mostrar_seccion_tabla(
+        ok_comision,
+        "Operaciones conciliadas correctamente pero con comisión mayor a cero.",
+        "No hay operaciones OK con comisión.",
+        "Descargar OK con comisión", "ok_con_comision", codigo,
+    )
 
-    # --- Detalle completo (bajo demanda) ---
     st.subheader("Detalle completo de operaciones del TXT")
     if st.button("Generar detalle completo"):
         st.session_state.ver_detalle = True
     if st.session_state.ver_detalle:
         st.dataframe(df_detalle)
-        datos, ext, mime = generar_descarga(df_detalle)
-        st.download_button(f"Descargar detalle completo ({ext.upper()})", datos,
-                           file_name=f"conciliacion_detalle_{codigo}.{ext}", mime=mime)
+        boton_descarga(df_detalle, "Descargar detalle completo", "conciliacion_detalle", codigo)
 
-    # --- Solo en Metabase (bajo demanda) ---
     st.subheader("Operaciones solo en Metabase")
     st.write(f"{len(df_solo_metabase)} operaciones registradas en Metabase que no figuran en el TXT. "
              "Se listan con fines informativos y no forman parte del análisis.")
@@ -414,6 +398,4 @@ if st.session_state.resultado_detalle is not None:
         st.session_state.ver_solo_metabase = True
     if st.session_state.ver_solo_metabase:
         st.dataframe(df_solo_metabase)
-        datos, ext, mime = generar_descarga(df_solo_metabase)
-        st.download_button(f"Descargar solo en Metabase ({ext.upper()})", datos,
-                           file_name=f"solo_metabase_{codigo}.{ext}", mime=mime)
+        boton_descarga(df_solo_metabase, "Descargar solo en Metabase", "solo_metabase", codigo)
