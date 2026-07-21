@@ -196,13 +196,13 @@ def generar_csv(df):
 
 
 # -----------------------
-# UI
+# INTERFAZ
 # -----------------------
-st.title("📄 Conciliación Diaria — GMoney")
-st.caption("Conciliación 100% local. Acepta el CSV o el Excel de deudas pagadas.")
+st.title("Conciliación Diaria — GMoney")
+st.caption("Conciliación local de operaciones QR. Acepta el CSV o el Excel de deudas pagadas.")
 st.divider()
 
-st.subheader("Subir archivos")
+st.subheader("Carga de archivos")
 archivo_metabase = st.file_uploader(
     "Metabase — CSV o Excel de deudas pagadas", type=["xlsx", "xls", "csv"],
     accept_multiple_files=True, key="uploader_metabase"
@@ -222,16 +222,15 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
             st.error("El archivo GMoney no contiene registros válidos.")
             st.stop()
 
-        with st.spinner("Conciliando localmente..."):
+        with st.spinner("Procesando conciliación..."):
             df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
 
         st.session_state.resultado_detalle       = df_detalle
         st.session_state.resultado_solo_metabase  = df_solo_metabase
         st.session_state.resultado_resumen        = resumen
         st.session_state.codigo_conciliacion      = codigo
-        st.session_state.ver_detalle              = False   # reset al reconciliar
+        st.session_state.ver_detalle              = False
         st.session_state.ver_solo_metabase        = False
-        st.success(f"✅ Conciliación completada — código `{codigo}`")
 
     except KeyError as e:
         st.error(f"Falta una columna esperada en el archivo: {e}")
@@ -246,55 +245,69 @@ if st.session_state.resultado_detalle is not None:
     resumen          = st.session_state.resultado_resumen
     codigo           = st.session_state.codigo_conciliacion
 
-    # --- Resumen ---
     st.divider()
-    st.subheader("Resumen de conciliación")
-    st.markdown("**Totales de entrada**")
-    st.write(resumen["entradas"])
-    st.markdown("**Desglose por categoría (operaciones del TXT)**")
-    st.write(resumen["categorias"])
-    st.caption(f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']}")
+    st.caption(f"Código de conciliación: {codigo}")
 
+    # --- Totales de entrada ---
+    st.subheader("Totales de entrada")
+    df_entradas = pd.DataFrame(
+        [{"Concepto": k, "Cantidad": v} for k, v in resumen["entradas"].items()]
+    )
+    st.table(df_entradas)
+
+    # --- Desglose por categoría ---
+    st.subheader("Desglose por categoría")
+    df_categorias = pd.DataFrame(
+        [{"Categoría": k, "Operaciones": v} for k, v in resumen["categorias"].items()]
+    )
+    st.table(df_categorias)
+    st.caption(
+        f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']} operaciones."
+    )
+
+    # --- Verificación de cuadre ---
+    st.subheader("Verificación de cuadre")
     cuadre = resumen["cuadre_txt"]
-    if cuadre["cuadra"]:
-        st.success(f"Cuadre correcto: {cuadre['suma']} categorías = {cuadre['total']} líneas del TXT.")
-    else:
-        st.error(f"NO cuadra: categorías suman {cuadre['suma']} pero el TXT tiene {cuadre['total']}.")
+    df_cuadre = pd.DataFrame([
+        {"Concepto": "Suma de categorías", "Valor": cuadre["suma"]},
+        {"Concepto": "Total líneas TXT",   "Valor": cuadre["total"]},
+        {"Concepto": "Estado",             "Valor": "Cuadra" if cuadre["cuadra"] else "No cuadra"},
+    ])
+    st.table(df_cuadre)
+    if not cuadre["cuadra"]:
+        st.error("La suma de categorías no coincide con el total de líneas del TXT. Requiere revisión.")
 
-    # --- A investigar (siempre visible) ---
+    # --- Operaciones a investigar ---
+    st.subheader("Operaciones a investigar")
     a_investigar = df_detalle[
         df_detalle["resultado"].isin(["A investigar (falta en Metabase)", "Diferencia de monto"])
         | (df_detalle["tiene_comision"])
     ]
-    st.divider()
-    st.subheader("⚠️ Operaciones a investigar")
-    st.write("Incluye: operaciones aprobadas que faltan en Metabase, con monto principal distinto, "
-             "o con comisión mayor a 0 (marcadas en la columna 'tiene_comision').")
+    st.write("Incluye operaciones aprobadas que faltan en Metabase, con monto principal distinto, "
+             "o con comisión mayor a cero (columna 'tiene_comision').")
     if a_investigar.empty:
-        st.success("No hay operaciones a investigar.")
+        st.info("No se identificaron operaciones a investigar.")
     else:
         n_comision = int(a_investigar["tiene_comision"].sum())
-        st.warning(f"{len(a_investigar)} operaciones requieren revisión "
-                   f"({n_comision} con comisión).")
+        st.write(f"Total: {len(a_investigar)} operaciones ({n_comision} con comisión).")
         st.dataframe(a_investigar)
-        st.download_button("📥 Descargar 'A investigar' (.csv)", generar_csv(a_investigar),
+        st.download_button("Descargar operaciones a investigar (CSV)", generar_csv(a_investigar),
                            file_name=f"a_investigar_{codigo}.csv", mime="text/csv")
 
     # --- Detalle completo (bajo demanda) ---
-    st.divider()
-    st.subheader("Detalle completo (operaciones del TXT)")
+    st.subheader("Detalle completo de operaciones del TXT")
     if st.button("Generar detalle completo"):
         st.session_state.ver_detalle = True
     if st.session_state.ver_detalle:
         st.dataframe(df_detalle)
-        st.download_button("📥 Descargar detalle completo (.csv)", generar_csv(df_detalle),
+        st.download_button("Descargar detalle completo (CSV)", generar_csv(df_detalle),
                            file_name=f"conciliacion_detalle_{codigo}.csv", mime="text/csv")
 
     # --- Solo en Metabase (bajo demanda) ---
-    st.divider()
-    st.subheader("Informativo — Solo en Metabase (no investigar)")
-    st.write(f"{len(df_solo_metabase)} operaciones están en Metabase pero no en el TXT QR.")
-    if st.button("Generar tabla 'Solo en Metabase'"):
+    st.subheader("Operaciones solo en Metabase")
+    st.write(f"{len(df_solo_metabase)} operaciones registradas en Metabase que no figuran en el TXT. "
+             "Se listan con fines informativos y no forman parte del análisis.")
+    if st.button("Generar listado"):
         st.session_state.ver_solo_metabase = True
     if st.session_state.ver_solo_metabase:
         st.dataframe(df_solo_metabase)
