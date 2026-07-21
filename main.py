@@ -12,7 +12,6 @@ st.set_page_config(
     layout="wide"
 )
 
-TIMEZONE = pytz.timezone('America/Lima')
 TOLERANCIA_MONTO = 0.01
 
 # -----------------------
