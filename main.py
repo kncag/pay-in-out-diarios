@@ -3,11 +3,10 @@ import pandas as pd
 from datetime import datetime
 import re
 
-st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="centered")
 
 TOLERANCIA_MONTO = 0.01
 
-# IDs largos como texto: no son cantidades y desbordan int64 si se leen como número.
 COLS_TEXTO = {
     "PPY_external_id": str,
     "Deuda_PspTin": str,
@@ -15,9 +14,29 @@ COLS_TEXTO = {
     "Deudor_Documento": str,
 }
 
-for k in ["resultado_detalle", "resultado_solo_metabase", "resultado_resumen", "codigo_conciliacion"]:
+MAPA_METABASE = {
+    "Comercio_Nombre":         "comercio_nombre",
+    "Deudor_Documento":        "deudor_documento",
+    "Deudor_Nombre":           "deudor_nombre",
+    "amount":                  "amount",
+    "Deuda_Estado":            "estado",
+    "PC_create_date_GMT_Peru": "fecha_operacion",
+    "PPY_external_id":         "id_operacion",
+}
+COLUMNAS_SALIDA = ["id_operacion", "comercio_nombre", "deudor_documento",
+                   "deudor_nombre", "amount", "estado", "fecha_operacion"]
+
+_DEFAULTS = {
+    "resultado_detalle": None,
+    "resultado_solo_metabase": None,
+    "resultado_resumen": None,
+    "codigo_conciliacion": None,
+    "ver_detalle": False,
+    "ver_solo_metabase": False,
+}
+for k, v in _DEFAULTS.items():
     if k not in st.session_state:
-        st.session_state[k] = None
+        st.session_state[k] = v
 
 
 def generate_session_id():
@@ -78,39 +97,29 @@ def parsear_gmoney_qr(archivo):
     ])
 
 
-# Mapeo único: CSV y Excel comparten los mismos nombres de columna planos.
-MAPA_METABASE = {
-    "Comercio_Nombre":         "comercio_nombre",
-    "Deudor_Documento":        "deudor_documento",
-    "Deudor_Nombre":           "deudor_nombre",
-    "amount":                  "amount",
-    "Deuda_Estado":            "estado",
-    "PC_create_date_GMT_Peru": "fecha_operacion",
-    "PPY_external_id":         "id_operacion",
-}
-COLUMNAS_SALIDA = ["id_operacion", "comercio_nombre", "deudor_documento",
-                   "deudor_nombre", "amount", "estado", "fecha_operacion"]
-
-
 def _normalizar_metabase(df):
-    """Renombra y tipa columnas al esquema unificado (CSV y Excel usan las mismas columnas)."""
+    """Renombra y tipa columnas al esquema unificado. Falla claro si faltan las críticas."""
     df = df.rename(columns=MAPA_METABASE)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df["fecha_operacion"] = pd.to_datetime(df["fecha_operacion"], errors="coerce", dayfirst=True)
-    df["id_operacion"] = df["id_operacion"].astype(str).str.strip()
+    if "amount" in df.columns:
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    if "fecha_operacion" in df.columns:
+        df["fecha_operacion"] = pd.to_datetime(df["fecha_operacion"], errors="coerce", dayfirst=True)
+    if "id_operacion" in df.columns:
+        df["id_operacion"] = df["id_operacion"].astype(str).str.strip()
+
+    faltantes = [c for c in ["id_operacion", "amount"] if c not in df.columns]
+    if faltantes:
+        st.error(f"Al archivo le faltan columnas críticas: {faltantes}. "
+                 f"Columnas encontradas: {list(df.columns)}")
+        st.stop()
     return df[[c for c in COLUMNAS_SALIDA if c in df.columns]]
 
 
 def cargar_metabase(archivos):
-    """
-    Acepta CSV plano o Excel de deudas pagadas. Ambos traen las mismas columnas
-    planas (incluida PPY_external_id como key y amount como monto), así que se
-    normalizan igual. La columna JSON del Excel (PC_OP_metadata) no se usa.
-    """
+    """Acepta CSV o Excel de deudas pagadas; ambos traen las mismas columnas planas."""
     dfs = []
     for a in archivos:
-        nombre = a.name.lower()
-        if nombre.endswith((".xlsx", ".xls")):
+        if a.name.lower().endswith((".xlsx", ".xls")):
             df = pd.read_excel(a, dtype=COLS_TEXTO)
         else:
             df = pd.read_csv(a, dtype=COLS_TEXTO, encoding="latin-1")
@@ -160,35 +169,23 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     ids_txt = set(df_gm["join_key"])
     df_solo_metabase = df_met[~df_met["join_key"].isin(ids_txt)].copy()
 
-    ids_txt = set(df_gm["join_key"])
-    df_solo_metabase = df_met[~df_met["join_key"].isin(ids_txt)].copy()
-
-    # --- Totales de entrada ---
-    total_txt      = len(df_gm)
-    total_metabase = len(df_met)
-    txt_aprobadas  = int((df_gm["estado_ar"] == "A").sum())
-    txt_rechazadas = int((df_gm["estado_ar"] == "R").sum())
-
-    # --- Desglose por categoría (sobre las operaciones del TXT) ---
     por_categoria = df_detalle["resultado"].value_counts().to_dict()
+    suma_cat = int(sum(por_categoria.values()))
+    total_txt = len(df_gm)
 
     resumen = {
         "entradas": {
-            "Líneas en TXT (GMoney)":      total_txt,
-            "  · Aprobadas (A)":           txt_aprobadas,
-            "  · Rechazadas (R)":          txt_rechazadas,
-            "Líneas en Metabase (CSV/Excel)": total_metabase,
+            "Líneas en TXT (GMoney)":          total_txt,
+            "  · Aprobadas (A)":               int((df_gm["estado_ar"] == "A").sum()),
+            "  · Rechazadas (R)":              int((df_gm["estado_ar"] == "R").sum()),
+            "Líneas en Metabase (CSV/Excel)":  len(df_met),
         },
         "categorias": {k: int(v) for k, v in por_categoria.items()},
         "solo_metabase": len(df_solo_metabase),
-        # cuadre: la suma de categorías del TXT debe igualar el total de líneas del TXT
         "cuadre_txt": {
-            "Suma categorías TXT": int(sum(por_categoria.values())),
-            "Total líneas TXT":    total_txt,
-            "¿Cuadra?":            "✅ Sí" if sum(por_categoria.values()) == total_txt else "⚠️ NO",
+            "suma": suma_cat, "total": total_txt, "cuadra": suma_cat == total_txt,
         },
     }
-
     return df_detalle, df_solo_metabase, resumen
 
 
@@ -199,27 +196,22 @@ def generar_csv(df):
 # -----------------------
 # UI
 # -----------------------
-st.title("📄 Conciliación Diaria — GMoney (Local)")
-st.caption("Conciliación 100% local. Acepta el CSV o el Excel de deudas pagadas — la misma información.")
+st.title("📄 Conciliación Diaria — GMoney")
+st.caption("Conciliación 100% local. Acepta el CSV o el Excel de deudas pagadas.")
 st.divider()
 
-st.header("Subir archivos")
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Metabase")
-    archivo_metabase = st.file_uploader(
-        "CSV o Excel de deudas pagadas", type=["xlsx", "xls", "csv"],
-        accept_multiple_files=True, key="uploader_metabase"
-    )
-with col2:
-    st.subheader("GMoney")
-    archivo_gmoney = st.file_uploader("Archivo txt GMoney", type=["txt"], key="uploader_gmoney")
+st.subheader("Subir archivos")
+archivo_metabase = st.file_uploader(
+    "Metabase — CSV o Excel de deudas pagadas", type=["xlsx", "xls", "csv"],
+    accept_multiple_files=True, key="uploader_metabase"
+)
+archivo_gmoney = st.file_uploader("GMoney — archivo TXT", type=["txt"], key="uploader_gmoney")
 st.divider()
 
 df_metabase = cargar_metabase(archivo_metabase) if archivo_metabase else None
 archivos_listos = df_metabase is not None and archivo_gmoney is not None
 
-if st.button("Conciliar", disabled=not archivos_listos, type="primary", width="stretch"):
+if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
     codigo = generate_session_id()
     try:
         archivo_gmoney.seek(0)
@@ -235,6 +227,8 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary", width="s
         st.session_state.resultado_solo_metabase  = df_solo_metabase
         st.session_state.resultado_resumen        = resumen
         st.session_state.codigo_conciliacion      = codigo
+        st.session_state.ver_detalle              = False   # reset al reconciliar
+        st.session_state.ver_solo_metabase        = False
         st.success(f"✅ Conciliación completada — código `{codigo}`")
 
     except KeyError as e:
@@ -250,32 +244,22 @@ if st.session_state.resultado_detalle is not None:
     resumen          = st.session_state.resultado_resumen
     codigo           = st.session_state.codigo_conciliacion
 
-    st.divider()
+    # --- Resumen ---
     st.divider()
     st.subheader("Resumen de conciliación")
+    st.markdown("**Totales de entrada**")
+    st.write(resumen["entradas"])
+    st.markdown("**Desglose por categoría (operaciones del TXT)**")
+    st.write(resumen["categorias"])
+    st.caption(f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']}")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Totales de entrada**")
-        st.write(resumen["entradas"])
-    with c2:
-        st.markdown("**Desglose por categoría (operaciones del TXT)**")
-        st.write(resumen["categorias"])
-        st.caption(f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']}")
-
-    st.markdown("**Verificación de cuadre**")
     cuadre = resumen["cuadre_txt"]
-    if cuadre["¿Cuadra?"].startswith("✅"):
-        st.success(
-            f"Cuadra: las {cuadre['Suma categorías TXT']} operaciones categorizadas "
-            f"= {cuadre['Total líneas TXT']} líneas del TXT."
-        )
+    if cuadre["cuadra"]:
+        st.success(f"Cuadre correcto: {cuadre['suma']} categorías = {cuadre['total']} líneas del TXT.")
     else:
-        st.error(
-            f"NO cuadra: categorías suman {cuadre['Suma categorías TXT']} "
-            f"pero el TXT tiene {cuadre['Total líneas TXT']} líneas. Revisar."
-        )
+        st.error(f"NO cuadra: categorías suman {cuadre['suma']} pero el TXT tiene {cuadre['total']}.")
 
+    # --- A investigar (siempre visible) ---
     a_investigar = df_detalle[df_detalle["resultado"].isin(
         ["A investigar (falta en Metabase)", "Diferencia de monto"]
     )]
@@ -286,18 +270,25 @@ if st.session_state.resultado_detalle is not None:
         st.success("No hay operaciones a investigar.")
     else:
         st.warning(f"{len(a_investigar)} operaciones requieren revisión.")
-        st.dataframe(a_investigar, width="stretch")
+        st.dataframe(a_investigar)
         st.download_button("📥 Descargar 'A investigar' (.csv)", generar_csv(a_investigar),
                            file_name=f"a_investigar_{codigo}.csv", mime="text/csv")
 
+    # --- Detalle completo (bajo demanda) ---
     st.divider()
     st.subheader("Detalle completo (operaciones del TXT)")
-    st.dataframe(df_detalle, width="stretch")
-    st.download_button("📥 Descargar detalle completo (.csv)", generar_csv(df_detalle),
-                       file_name=f"conciliacion_detalle_{codigo}.csv", mime="text/csv")
+    if st.button("Generar detalle completo"):
+        st.session_state.ver_detalle = True
+    if st.session_state.ver_detalle:
+        st.dataframe(df_detalle)
+        st.download_button("📥 Descargar detalle completo (.csv)", generar_csv(df_detalle),
+                           file_name=f"conciliacion_detalle_{codigo}.csv", mime="text/csv")
 
+    # --- Solo en Metabase (bajo demanda) ---
     st.divider()
     st.subheader("Informativo — Solo en Metabase (no investigar)")
     st.write(f"{len(df_solo_metabase)} operaciones están en Metabase pero no en el TXT QR.")
-    with st.expander("Ver operaciones solo en Metabase"):
-        st.dataframe(df_solo_metabase, width="stretch")
+    if st.button("Generar tabla 'Solo en Metabase'"):
+        st.session_state.ver_solo_metabase = True
+    if st.session_state.ver_solo_metabase:
+        st.dataframe(df_solo_metabase)
