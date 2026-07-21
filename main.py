@@ -1,4 +1,11 @@
 import streamlit as st
+import subprocess
+import sys
+
+try:
+    import openpyxl  # noqa
+except ModuleNotFoundError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "openpyxl"], check=True)
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
