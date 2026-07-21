@@ -1,5 +1,4 @@
 import streamlit as st
-import openpyxl  # noqa
 import pandas as pd
 from datetime import datetime
 from io import BytesIO
