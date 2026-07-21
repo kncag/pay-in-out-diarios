@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from io import BytesIO
 import re
 
 # -----------------------
@@ -17,16 +18,13 @@ TOLERANCIA_MONTO = 0.01
 # -----------------------
 # SESSION STATE
 # -----------------------
-if "resultado_importes" not in st.session_state:
-    st.session_state.resultado_importes = None
-if "resultado_detalle" not in st.session_state:
-    st.session_state.resultado_detalle = None
-if "codigo_conciliacion" not in st.session_state:
-    st.session_state.codigo_conciliacion = None
+for k in ["resultado_detalle", "resultado_solo_metabase", "resultado_resumen", "codigo_conciliacion"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
 
 
 # -----------------------
-# FUNCIONES DE UTILIDAD
+# FUNCIONES
 # -----------------------
 def generate_session_id():
     """Identificador único de la corrida (solo trazabilidad en pantalla)."""
@@ -46,8 +44,6 @@ def parsear_gmoney_qr(archivo):
       [57:73]   COMISIÓN/fee en céntimos con signo '+' (vacío si no aplica) → /100
       [117:145] ID transacción de 28 dígitos → KEY (== PPY_external_id del CSV)
       [152:163] estado (ej. '490000A0922'); letra A/R
-
-    Retorna (df, fecha_min, fecha_max).
     """
     contenido = archivo.read().decode("latin-1")
     archivo.seek(0)
@@ -136,19 +132,20 @@ def mapear_metabase_payin(df_metabase, codigo_conciliacion):
 
 def conciliar_qr(df_metabase_mapeado, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     """
-    Concilia Metabase vs GMoney QR localmente.
-    Key: id_operacion (PPY_external_id) == id_transaccion_cce (28 dígitos).
+    Concilia desde el TXT GMoney como fuente de verdad (left join).
+    El CSV de Metabase trae de más (todos los canales); solo interesa
+    verificar que cada operación del TXT esté en el CSV.
 
-    Categorías de resultado:
-      OK                  - casa en ambos, mismo monto, estado A
-      Diferencia de monto - casa pero montos distintos, estado A
-      Rechazada (R)       - operación rechazada en GMoney (categoría aparte)
-      Solo en Metabase    - sin match en GMoney
-      Solo en GMoney      - sin match en Metabase
+    Categorías:
+      OK                       - TXT aprobada + en CSV, monto principal cuadra
+      Diferencia de monto      - TXT aprobada + en CSV, monto principal distinto
+      A investigar (falta CSV) - TXT APROBADA pero NO en CSV  ← hallazgo clave
+      Rechazada (R)            - TXT estado R (no en CSV, esperado)
+
+    Retorna (df_detalle, df_solo_metabase, resumen)
     """
     df_met = df_metabase_mapeado.copy()
     df_met["join_key"] = df_met["id_operacion"].astype(str).str.strip()
-    df_met = df_met.drop(columns=["id_operacion"])
 
     df_gm = df_gmoney.copy()
     df_gm["join_key"] = df_gm["id_transaccion_cce"].astype(str).str.strip()
@@ -156,58 +153,60 @@ def conciliar_qr(df_metabase_mapeado, df_gmoney, tolerancia=TOLERANCIA_MONTO):
         df_gm["fecha_gmoney"] + " " + df_gm["hora_completa"], errors="coerce"
     )
 
-    merged = df_met.merge(df_gm, on="join_key", how="outer", suffixes=("_metabase", "_gmoney"))
+    # LEFT JOIN desde el TXT
+    merged = df_gm.merge(
+        df_met.drop(columns=["id_operacion"]),
+        on="join_key", how="left", suffixes=("_gmoney", "_metabase")
+    )
 
     def _resultado(row):
-        m = row.get("amount")
-        g = row.get("monto_gmoney")
-        m_na, g_na = pd.isna(m), pd.isna(g)
-        if m_na and not g_na:
-            return "Solo en GMoney"
-        if g_na and not m_na:
-            return "Solo en Metabase"
+        en_csv = not pd.isna(row.get("amount"))
         if row.get("estado_ar") == "R":
             return "Rechazada (R)"
-        if abs(m - g) <= tolerancia:
+        if not en_csv:
+            return "A investigar (falta en CSV)"
+        if abs(row["amount"] - row["monto_gmoney"]) <= tolerancia:
             return "OK"
         return "Diferencia de monto"
 
-    merged["diferencia"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
+    merged["dif_monto"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
     merged["resultado"] = merged.apply(_resultado, axis=1)
 
-    # --- Detalle por operación ---
+    # Detalle (operaciones del TXT) — monto y comisión en columnas separadas
     df_detalle = merged.rename(columns={
-        "join_key":     "id_operacion",
-        "amount":       "amount_metabase",
-        "monto_gmoney": "amount_gmoney",
+        "join_key":        "id_operacion",
+        "amount":          "monto_metabase",
     })
-    columnas_detalle = [
-        "id_operacion", "fecha_operacion", "fecha_gmoney_dt",
-        "amount_metabase", "amount_gmoney", "comision_gmoney",
-        "diferencia", "resultado", "estado_ar",
+    columnas = [
+        "id_operacion", "estado_ar", "resultado",
+        "monto_gmoney", "monto_metabase", "dif_monto",
+        "comision_gmoney",
+        "fecha_gmoney_dt", "fecha_operacion",
         "comercio_nombre", "deudor_documento",
     ]
-    columnas_detalle = [c for c in columnas_detalle if c in df_detalle.columns]
-    df_detalle = df_detalle[columnas_detalle].rename(columns={"fecha_gmoney_dt": "fecha_gmoney"})
+    columnas = [c for c in columnas if c in df_detalle.columns]
+    df_detalle = df_detalle[columnas].rename(columns={
+        "fecha_gmoney_dt": "fecha_gmoney",
+        "fecha_operacion": "fecha_metabase",
+    })
 
-    # --- Importes agregados por día (aprobadas vs rechazadas por separado) ---
-    fecha_dia_met = pd.to_datetime(merged["fecha_operacion"], errors="coerce").dt.date
-    fecha_dia_gm  = merged["fecha_gmoney_dt"].dt.date
-    merged["fecha_dia"] = fecha_dia_met.fillna(fecha_dia_gm)
+    # Solo en Metabase (informativo)
+    ids_txt = set(df_gm["join_key"])
+    df_solo_metabase = df_met[~df_met["join_key"].isin(ids_txt)].copy()
 
-    # Excluye rechazadas del cálculo de diferencia de importes
-    aprob = merged[merged["estado_ar"] != "R"]
-    df_importes = (
-        aprob.groupby("fecha_dia")
-        .agg(total_metabase=("amount", "sum"), total_gmoney=("monto_gmoney", "sum"))
-        .reset_index()
-    )
-    df_importes["diferencia"] = (df_importes["total_metabase"] - df_importes["total_gmoney"]).round(2)
-    df_importes["estado"] = df_importes["diferencia"].abs().apply(
-        lambda x: "Conciliado" if x <= tolerancia else "Diferencias"
-    )
+    resumen = df_detalle["resultado"].value_counts().to_dict()
+    resumen["Solo en Metabase (informativo)"] = len(df_solo_metabase)
 
-    return df_importes, df_detalle
+    return df_detalle, df_solo_metabase, resumen
+
+
+def generar_excel(df, sheet_name="Detalle"):
+    """Convierte un DataFrame a bytes de un .xlsx en memoria."""
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # -----------------------
@@ -219,7 +218,7 @@ st.divider()
 
 tipo_conciliacion = st.selectbox(
     "Selecciona el tipo de conciliación",
-    ["Conciliacion PayOuts - Diaria", "Conciliacion PayIns - Diaria (QR)"]
+    ["Conciliacion PayIns - Diaria (QR)"]
 )
 
 st.header("Subir archivos")
@@ -251,25 +250,23 @@ archivos_listos = df_metabase is not None and archivo_gmoney is not None
 if st.button("Conciliar", disabled=not archivos_listos, type="primary", use_container_width=True):
     codigo_conciliacion = generate_session_id()
     try:
-        if tipo_conciliacion == "Conciliacion PayIns - Diaria (QR)":
-            archivo_gmoney.seek(0)
-            df_gmoney, fecha_min, fecha_max = parsear_gmoney_qr(archivo_gmoney)
+        archivo_gmoney.seek(0)
+        df_gmoney, fecha_min, fecha_max = parsear_gmoney_qr(archivo_gmoney)
 
-            if df_gmoney.empty:
-                st.error("El archivo GMoney no contiene registros válidos.")
-                st.stop()
+        if df_gmoney.empty:
+            st.error("El archivo GMoney no contiene registros válidos.")
+            st.stop()
 
-            df_mapeado_mb = mapear_metabase_payin(df_metabase, codigo_conciliacion)
+        df_mapeado_mb = mapear_metabase_payin(df_metabase, codigo_conciliacion)
 
-            with st.spinner("Conciliando localmente..."):
-                df_importes, df_detalle = conciliar_qr(df_mapeado_mb, df_gmoney)
+        with st.spinner("Conciliando localmente..."):
+            df_detalle, df_solo_metabase, resumen = conciliar_qr(df_mapeado_mb, df_gmoney)
 
-            st.session_state.resultado_importes  = df_importes
-            st.session_state.resultado_detalle   = df_detalle
-            st.session_state.codigo_conciliacion = codigo_conciliacion
-            st.success(f"✅ Conciliación completada — código `{codigo_conciliacion}`")
-        else:
-            st.warning("El flujo PayOuts - Diaria usa el parser anterior. Selecciona PayIns para el flujo QR.")
+        st.session_state.resultado_detalle       = df_detalle
+        st.session_state.resultado_solo_metabase  = df_solo_metabase
+        st.session_state.resultado_resumen        = resumen
+        st.session_state.codigo_conciliacion      = codigo_conciliacion
+        st.success(f"✅ Conciliación completada — código `{codigo_conciliacion}`")
 
     except KeyError as e:
         st.error(f"Falta una columna esperada en el archivo: {e}")
@@ -282,30 +279,48 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary", use_cont
 # RESULTADOS
 # -----------------------
 if st.session_state.resultado_detalle is not None:
-    df_importes = st.session_state.resultado_importes
-    df_detalle  = st.session_state.resultado_detalle
+    df_detalle       = st.session_state.resultado_detalle
+    df_solo_metabase = st.session_state.resultado_solo_metabase
+    resumen          = st.session_state.resultado_resumen
 
     st.divider()
-    st.subheader("Conciliación por importes por día")
-    st.write("Montos totales agregados por día (excluye operaciones rechazadas), Metabase vs GMoney.")
-    if not df_importes.empty and (df_importes["estado"] == "Diferencias").any():
-        st.dataframe(df_importes, use_container_width=True)
-        st.warning("Se identificaron diferencias por importes en al menos un día.")
+    st.subheader("Resumen de conciliación")
+    st.write({k: int(v) for k, v in resumen.items()})
+
+    # Hallazgos a investigar
+    a_investigar = df_detalle[df_detalle["resultado"].isin(
+        ["A investigar (falta en CSV)", "Diferencia de monto"]
+    )]
+    st.divider()
+    st.subheader("⚠️ Operaciones a investigar")
+    st.write("Operaciones aprobadas del TXT que faltan en el CSV o tienen monto principal distinto.")
+    if a_investigar.empty:
+        st.success("No hay operaciones a investigar. Todo lo aprobado del TXT está en el CSV y cuadra.")
     else:
-        st.dataframe(df_importes, use_container_width=True)
-        st.success("No se encontraron diferencias por importes.")
+        st.warning(f"{len(a_investigar)} operaciones requieren revisión.")
+        st.dataframe(a_investigar, use_container_width=True)
+        st.download_button(
+            label="📥 Descargar 'A investigar' (.xlsx)",
+            data=generar_excel(a_investigar, sheet_name="A_investigar"),
+            file_name=f"a_investigar_{st.session_state.codigo_conciliacion}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
+    # Detalle completo del TXT
     st.divider()
-    st.subheader("Conciliación por detalle de operaciones")
-    st.write("Resultado a nivel de operación individual, Metabase vs GMoney.")
-
-    # Resumen por categoría
-    resumen = df_detalle["resultado"].value_counts()
-    st.write("Resumen:", {k: int(v) for k, v in resumen.items()})
-
-    diferencias_reales = df_detalle[~df_detalle["resultado"].isin(["OK", "Rechazada (R)"])]
+    st.subheader("Detalle completo (operaciones del TXT)")
     st.dataframe(df_detalle, use_container_width=True)
-    if not diferencias_reales.empty:
-        st.warning(f"Se identificaron {len(diferencias_reales)} diferencias (sin contar rechazadas).")
-    else:
-        st.success("No se encontraron diferencias (fuera de las rechazadas, que son categoría aparte).")
+    st.download_button(
+        label="📥 Descargar detalle completo (.xlsx)",
+        data=generar_excel(df_detalle),
+        file_name=f"conciliacion_detalle_{st.session_state.codigo_conciliacion}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    # Informativo: solo en Metabase
+    st.divider()
+    st.subheader("Informativo — Solo en Metabase (no investigar)")
+    st.write(f"{len(df_solo_metabase)} operaciones están en el CSV pero no en el TXT QR. "
+             "Es esperado: el CSV incluye otros canales. No requieren acción.")
+    with st.expander("Ver operaciones solo en Metabase"):
+        st.dataframe(df_solo_metabase, use_container_width=True)
