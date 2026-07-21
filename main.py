@@ -160,8 +160,35 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     ids_txt = set(df_gm["join_key"])
     df_solo_metabase = df_met[~df_met["join_key"].isin(ids_txt)].copy()
 
-    resumen = df_detalle["resultado"].value_counts().to_dict()
-    resumen["Solo en Metabase (informativo)"] = len(df_solo_metabase)
+    ids_txt = set(df_gm["join_key"])
+    df_solo_metabase = df_met[~df_met["join_key"].isin(ids_txt)].copy()
+
+    # --- Totales de entrada ---
+    total_txt      = len(df_gm)
+    total_metabase = len(df_met)
+    txt_aprobadas  = int((df_gm["estado_ar"] == "A").sum())
+    txt_rechazadas = int((df_gm["estado_ar"] == "R").sum())
+
+    # --- Desglose por categoría (sobre las operaciones del TXT) ---
+    por_categoria = df_detalle["resultado"].value_counts().to_dict()
+
+    resumen = {
+        "entradas": {
+            "Líneas en TXT (GMoney)":      total_txt,
+            "  · Aprobadas (A)":           txt_aprobadas,
+            "  · Rechazadas (R)":          txt_rechazadas,
+            "Líneas en Metabase (CSV/Excel)": total_metabase,
+        },
+        "categorias": {k: int(v) for k, v in por_categoria.items()},
+        "solo_metabase": len(df_solo_metabase),
+        # cuadre: la suma de categorías del TXT debe igualar el total de líneas del TXT
+        "cuadre_txt": {
+            "Suma categorías TXT": int(sum(por_categoria.values())),
+            "Total líneas TXT":    total_txt,
+            "¿Cuadra?":            "✅ Sí" if sum(por_categoria.values()) == total_txt else "⚠️ NO",
+        },
+    }
+
     return df_detalle, df_solo_metabase, resumen
 
 
@@ -224,8 +251,30 @@ if st.session_state.resultado_detalle is not None:
     codigo           = st.session_state.codigo_conciliacion
 
     st.divider()
+    st.divider()
     st.subheader("Resumen de conciliación")
-    st.write({k: int(v) for k, v in resumen.items()})
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Totales de entrada**")
+        st.write(resumen["entradas"])
+    with c2:
+        st.markdown("**Desglose por categoría (operaciones del TXT)**")
+        st.write(resumen["categorias"])
+        st.caption(f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']}")
+
+    st.markdown("**Verificación de cuadre**")
+    cuadre = resumen["cuadre_txt"]
+    if cuadre["¿Cuadra?"].startswith("✅"):
+        st.success(
+            f"Cuadra: las {cuadre['Suma categorías TXT']} operaciones categorizadas "
+            f"= {cuadre['Total líneas TXT']} líneas del TXT."
+        )
+    else:
+        st.error(
+            f"NO cuadra: categorías suman {cuadre['Suma categorías TXT']} "
+            f"pero el TXT tiene {cuadre['Total líneas TXT']} líneas. Revisar."
+        )
 
     a_investigar = df_detalle[df_detalle["resultado"].isin(
         ["A investigar (falta en Metabase)", "Diferencia de monto"]
