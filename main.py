@@ -195,12 +195,12 @@ st.divider()
 df_metabase = None
 if archivo_metabase:
     # IDs y códigos largos como texto: no son cantidades y desbordan int64 si se leen como número
-COLS_TEXTO = {
-    "PPY_external_id": str,
-    "Deuda_PspTin": str,
-    "Deuda_public_id": str,
-    "Deudor_Documento": str,
-}
+    COLS_TEXTO = {
+        "PPY_external_id": str,
+        "Deuda_PspTin": str,
+        "Deuda_public_id": str,
+        "Deudor_Documento": str,
+    }
 df_metabase = pd.concat(
     [pd.read_csv(a, dtype=COLS_TEXTO) for a in archivo_metabase],
     ignore_index=True
