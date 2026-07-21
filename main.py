@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+import openpyxl
 import re
 
 st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="wide")
