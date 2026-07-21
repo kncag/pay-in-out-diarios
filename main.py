@@ -38,6 +38,7 @@ _DEFAULTS = {
     "resultado_resumen": None,
     "codigo_conciliacion": None,
     "json_anomalos": None,
+    "json_anomalos_completo": None,
     "ver_detalle": False,
     "ver_solo_metabase": False,
 }
@@ -138,41 +139,30 @@ def _normalizar_metabase(df):
     return df[[c for c in COLUMNAS_SALIDA if c in df.columns]]
 
 
-def procesar_metabase(archivos):
-    """
-    Lee cada archivo UNA sola vez y devuelve:
-      - df_metabase: normalizado para conciliar
-      - df_anomalos: filas con metadata JSON anómala (clave/code/reason)
-    """
-    normalizados, anomalos = [], []
-    for a in archivos:
-        crudo = _leer_archivo(a)
-        normalizados.append(_normalizar_metabase(crudo))
-        anomalos.append(_detectar_anomalos(crudo))
-
-    df_metabase = pd.concat(normalizados, ignore_index=True) if normalizados else None
-    df_anomalos = (pd.concat(anomalos, ignore_index=True) if anomalos
-                   else pd.DataFrame(columns=["id_operacion", "claves_encontradas", "contenido_json"]))
-    return df_metabase, df_anomalos
-
-
 def _detectar_anomalos(df_crudo):
     """
     Detecta filas cuyo PC_OP_metadata contiene claves anómalas.
+    Devuelve (df_resumen, df_completo):
+      - df_resumen: 3 columnas para mostrar en pantalla
+      - df_completo: filas completas del archivo original (todas las columnas)
     Vectorizado: filtra por texto antes de parsear JSON (solo parsea candidatas).
     """
-    cols_vacias = ["id_operacion", "claves_encontradas", "contenido_json"]
+    cols_resumen = ["id_operacion", "claves_encontradas", "contenido_json"]
+    vacio_resumen = pd.DataFrame(columns=cols_resumen)
+    vacio_completo = df_crudo.iloc[0:0].copy()
+
     if "PC_OP_metadata" not in df_crudo.columns:
-        return pd.DataFrame(columns=cols_vacias)
+        return vacio_resumen, vacio_completo
 
     col = df_crudo["PC_OP_metadata"].astype(str)
     patron = "|".join(CLAVES_ANOMALAS)
     candidatas = df_crudo[col.str.contains(patron, na=False, regex=True)]
     if candidatas.empty:
-        return pd.DataFrame(columns=cols_vacias)
+        return vacio_resumen, vacio_completo
 
-    filas = []
-    for _, row in candidatas.iterrows():
+    filas_resumen = []
+    indices_anomalos = []
+    for idx, row in candidatas.iterrows():
         celda = str(row.get("PC_OP_metadata", "")).strip()
         if not celda.startswith("{"):
             continue
@@ -182,12 +172,38 @@ def _detectar_anomalos(df_crudo):
             continue
         presentes = CLAVES_ANOMALAS & set(d.keys())
         if presentes:
-            filas.append({
+            indices_anomalos.append(idx)
+            filas_resumen.append({
                 "id_operacion":       str(row.get("PPY_external_id", "")).strip(),
                 "claves_encontradas": ", ".join(sorted(presentes)),
                 "contenido_json":     celda,
             })
-    return pd.DataFrame(filas, columns=cols_vacias)
+
+    df_resumen = pd.DataFrame(filas_resumen, columns=cols_resumen)
+    df_completo = df_crudo.loc[indices_anomalos].copy()
+    return df_resumen, df_completo
+
+
+def procesar_metabase(archivos):
+    """
+    Lee cada archivo UNA sola vez y devuelve:
+      - df_metabase: normalizado para conciliar
+      - df_anomalos_resumen: 3 columnas para mostrar
+      - df_anomalos_completo: filas completas del original para descargar
+    """
+    normalizados, resumenes, completos = [], [], []
+    for a in archivos:
+        crudo = _leer_archivo(a)
+        normalizados.append(_normalizar_metabase(crudo))
+        res, comp = _detectar_anomalos(crudo)
+        resumenes.append(res)
+        completos.append(comp)
+
+    df_metabase = pd.concat(normalizados, ignore_index=True) if normalizados else None
+    df_res = (pd.concat(resumenes, ignore_index=True) if resumenes
+              else pd.DataFrame(columns=["id_operacion", "claves_encontradas", "contenido_json"]))
+    df_comp = pd.concat(completos, ignore_index=True) if completos else pd.DataFrame()
+    return df_metabase, df_res, df_comp
 
 
 def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
@@ -206,7 +222,7 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
         on="join_key", how="left", suffixes=("_gmoney", "_metabase")
     )
 
-    # Clasificación vectorizada (equivalente a la función _resultado fila por fila)
+    # Clasificación vectorizada (el orden importa: la primera condición verdadera gana)
     cond = [
         merged["estado_ar"] == "R",
         merged["amount"].isna(),
@@ -271,7 +287,7 @@ def boton_descarga(df, etiqueta, nombre_base, codigo):
 
 
 def mostrar_seccion_tabla(df, descripcion, msg_vacio, etiqueta_descarga, nombre_archivo, codigo):
-    """Renderiza una sección estándar: descripción + tabla + descarga, o mensaje si está vacía."""
+    """Sección estándar: descripción + tabla + descarga, o mensaje si está vacía."""
     st.write(descripcion)
     if df is None or df.empty:
         st.info(msg_vacio)
@@ -310,13 +326,14 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
             st.stop()
 
         with st.spinner("Procesando conciliación..."):
-            df_metabase, json_anom = procesar_metabase(archivo_metabase)
+            df_metabase, json_anom, json_anom_completo = procesar_metabase(archivo_metabase)
             df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
 
         st.session_state.resultado_detalle       = df_detalle
         st.session_state.resultado_solo_metabase  = df_solo_metabase
         st.session_state.resultado_resumen        = resumen
         st.session_state.json_anomalos            = json_anom
+        st.session_state.json_anomalos_completo   = json_anom_completo
         st.session_state.codigo_conciliacion      = codigo
         st.session_state.ver_detalle              = False
         st.session_state.ver_solo_metabase        = False
@@ -329,11 +346,12 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
         st.stop()
 
 if st.session_state.resultado_detalle is not None:
-    df_detalle       = st.session_state.resultado_detalle
-    df_solo_metabase = st.session_state.resultado_solo_metabase
-    resumen          = st.session_state.resultado_resumen
-    json_anom        = st.session_state.json_anomalos
-    codigo           = st.session_state.codigo_conciliacion
+    df_detalle         = st.session_state.resultado_detalle
+    df_solo_metabase   = st.session_state.resultado_solo_metabase
+    resumen            = st.session_state.resultado_resumen
+    json_anom          = st.session_state.json_anomalos
+    json_anom_completo = st.session_state.json_anomalos_completo
+    codigo             = st.session_state.codigo_conciliacion
 
     st.divider()
 
@@ -354,15 +372,19 @@ if st.session_state.resultado_detalle is not None:
     if not cuadre["cuadra"]:
         st.error("La suma de categorías no coincide con el total de líneas del TXT. Requiere revisión.")
 
+    # --- Metadata con estructura anómala (vista resumida, descarga completa) ---
     st.subheader("Metadata con estructura anómala")
-    mostrar_seccion_tabla(
-        json_anom,
-        "Operaciones cuyo campo PC_OP_metadata contiene las claves 'clave', 'code' o 'reason', "
-        "en lugar de la estructura estándar de una operación QR.",
-        "No se detectaron registros con metadata anómala.",
-        "Descargar metadata anómala", "metadata_anomala", codigo,
-    )
+    st.write("Operaciones cuyo campo PC_OP_metadata contiene las claves 'clave', 'code' o 'reason', "
+             "en lugar de la estructura estándar de una operación QR.")
+    if json_anom is None or json_anom.empty:
+        st.info("No se detectaron registros con metadata anómala.")
+    else:
+        st.write(f"Total: {len(json_anom)} registros.")
+        st.dataframe(json_anom)
+        boton_descarga(json_anom_completo, "Descargar registros completos",
+                       "metadata_anomala_completo", codigo)
 
+    # --- Operaciones a investigar ---
     st.subheader("Operaciones a investigar")
 
     no_ok = df_detalle[df_detalle["resultado"].isin(
@@ -384,6 +406,7 @@ if st.session_state.resultado_detalle is not None:
         "Descargar OK con comisión", "ok_con_comision", codigo,
     )
 
+    # --- Detalle completo (bajo demanda) ---
     st.subheader("Detalle completo de operaciones del TXT")
     if st.button("Generar detalle completo"):
         st.session_state.ver_detalle = True
@@ -391,6 +414,7 @@ if st.session_state.resultado_detalle is not None:
         st.dataframe(df_detalle)
         boton_descarga(df_detalle, "Descargar detalle completo", "conciliacion_detalle", codigo)
 
+    # --- Solo en Metabase (bajo demanda) ---
     st.subheader("Operaciones solo en Metabase")
     st.write(f"{len(df_solo_metabase)} operaciones registradas en Metabase que no figuran en el TXT. "
              "Se listan con fines informativos y no forman parte del análisis.")
