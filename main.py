@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from io import BytesIO
 import json
 import re
 
-st.set_page_config(page_title="Conciliación Diaria — Local", layout="centered")
+st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="centered")
 
 TOLERANCIA_MONTO = 0.01
 
@@ -147,7 +148,6 @@ def detectar_json_anomalos(archivos):
     """
     Relee la columna PC_OP_metadata y detecta filas cuyo JSON contiene
     alguna de las claves anómalas (clave, code, reason).
-    Devuelve un DataFrame con las filas detectadas.
     """
     frames = []
     for a in archivos:
@@ -248,8 +248,20 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     return df_detalle, df_solo_metabase, resumen
 
 
-def generar_csv(df):
-    return df.to_csv(index=False).encode("utf-8-sig")
+def generar_descarga(df):
+    """
+    Genera bytes de descarga. Intenta Excel (.xlsx); si openpyxl no está
+    disponible, cae a CSV. Devuelve (bytes, extension, mime).
+    """
+    try:
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Datos")
+        buffer.seek(0)
+        return (buffer.getvalue(), "xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception:
+        return (df.to_csv(index=False).encode("utf-8-sig"), "csv", "text/csv")
 
 
 # -----------------------
@@ -347,25 +359,42 @@ if st.session_state.resultado_detalle is not None:
     else:
         st.write(f"Total: {len(json_anom)} registros.")
         st.dataframe(json_anom)
-        st.download_button("Descargar metadata anómala (CSV)", generar_csv(json_anom),
-                           file_name=f"metadata_anomala_{codigo}.csv", mime="text/csv")
+        datos, ext, mime = generar_descarga(json_anom)
+        st.download_button(f"Descargar metadata anómala ({ext.upper()})", datos,
+                           file_name=f"metadata_anomala_{codigo}.{ext}", mime=mime)
 
     # --- Operaciones a investigar ---
     st.subheader("Operaciones a investigar")
-    a_investigar = df_detalle[
+
+    # Tabla 1: resultado distinto de OK
+    no_ok = df_detalle[
         df_detalle["resultado"].isin(["A investigar (falta en Metabase)", "Diferencia de monto"])
-        | (df_detalle["tiene_comision"])
     ]
-    st.write("Incluye operaciones aprobadas que faltan en Metabase, con monto principal distinto, "
-             "o con comisión mayor a cero (columna 'tiene_comision').")
-    if a_investigar.empty:
-        st.info("No se identificaron operaciones a investigar.")
+    st.markdown("**Operaciones con incidencia (resultado distinto de OK)**")
+    st.write("Operaciones aprobadas que faltan en Metabase o tienen monto principal distinto.")
+    if no_ok.empty:
+        st.info("No se identificaron operaciones con incidencia.")
     else:
-        n_comision = int(a_investigar["tiene_comision"].sum())
-        st.write(f"Total: {len(a_investigar)} operaciones ({n_comision} con comisión).")
-        st.dataframe(a_investigar)
-        st.download_button("Descargar operaciones a investigar (CSV)", generar_csv(a_investigar),
-                           file_name=f"a_investigar_{codigo}.csv", mime="text/csv")
+        st.write(f"Total: {len(no_ok)} operaciones.")
+        st.dataframe(no_ok)
+        datos, ext, mime = generar_descarga(no_ok)
+        st.download_button(f"Descargar operaciones con incidencia ({ext.upper()})", datos,
+                           file_name=f"incidencias_{codigo}.{ext}", mime=mime)
+
+    # Tabla 2: OK con comisión
+    ok_comision = df_detalle[
+        (df_detalle["resultado"] == "OK") & (df_detalle["tiene_comision"])
+    ]
+    st.markdown("**Operaciones OK con comisión**")
+    st.write("Operaciones conciliadas correctamente pero con comisión mayor a cero.")
+    if ok_comision.empty:
+        st.info("No hay operaciones OK con comisión.")
+    else:
+        st.write(f"Total: {len(ok_comision)} operaciones.")
+        st.dataframe(ok_comision)
+        datos, ext, mime = generar_descarga(ok_comision)
+        st.download_button(f"Descargar OK con comisión ({ext.upper()})", datos,
+                           file_name=f"ok_con_comision_{codigo}.{ext}", mime=mime)
 
     # --- Detalle completo (bajo demanda) ---
     st.subheader("Detalle completo de operaciones del TXT")
@@ -373,8 +402,9 @@ if st.session_state.resultado_detalle is not None:
         st.session_state.ver_detalle = True
     if st.session_state.ver_detalle:
         st.dataframe(df_detalle)
-        st.download_button("Descargar detalle completo (CSV)", generar_csv(df_detalle),
-                           file_name=f"conciliacion_detalle_{codigo}.csv", mime="text/csv")
+        datos, ext, mime = generar_descarga(df_detalle)
+        st.download_button(f"Descargar detalle completo ({ext.upper()})", datos,
+                           file_name=f"conciliacion_detalle_{codigo}.{ext}", mime=mime)
 
     # --- Solo en Metabase (bajo demanda) ---
     st.subheader("Operaciones solo en Metabase")
@@ -384,3 +414,6 @@ if st.session_state.resultado_detalle is not None:
         st.session_state.ver_solo_metabase = True
     if st.session_state.ver_solo_metabase:
         st.dataframe(df_solo_metabase)
+        datos, ext, mime = generar_descarga(df_solo_metabase)
+        st.download_button(f"Descargar solo en Metabase ({ext.upper()})", datos,
+                           file_name=f"solo_metabase_{codigo}.{ext}", mime=mime)
