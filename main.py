@@ -155,9 +155,11 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     merged["dif_monto"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
     merged["resultado"] = merged.apply(_resultado, axis=1)
 
+    merged["tiene_comision"] = merged["comision_gmoney"].fillna(0) > 0
+
     df_detalle = merged.rename(columns={"join_key": "id_operacion", "amount": "monto_metabase"})
     columnas = [
-        "id_operacion", "estado_ar", "resultado",
+        "id_operacion", "estado_ar", "resultado", "tiene_comision",
         "monto_gmoney", "monto_metabase", "dif_monto", "comision_gmoney",
         "fecha_gmoney_dt", "fecha_operacion", "comercio_nombre", "deudor_documento",
     ]
@@ -260,16 +262,20 @@ if st.session_state.resultado_detalle is not None:
         st.error(f"NO cuadra: categorías suman {cuadre['suma']} pero el TXT tiene {cuadre['total']}.")
 
     # --- A investigar (siempre visible) ---
-    a_investigar = df_detalle[df_detalle["resultado"].isin(
-        ["A investigar (falta en Metabase)", "Diferencia de monto"]
-    )]
+    a_investigar = df_detalle[
+        df_detalle["resultado"].isin(["A investigar (falta en Metabase)", "Diferencia de monto"])
+        | (df_detalle["tiene_comision"])
+    ]
     st.divider()
     st.subheader("⚠️ Operaciones a investigar")
-    st.write("Operaciones aprobadas del TXT que faltan en Metabase o tienen monto principal distinto.")
+    st.write("Incluye: operaciones aprobadas que faltan en Metabase, con monto principal distinto, "
+             "o con comisión mayor a 0 (marcadas en la columna 'tiene_comision').")
     if a_investigar.empty:
         st.success("No hay operaciones a investigar.")
     else:
-        st.warning(f"{len(a_investigar)} operaciones requieren revisión.")
+        n_comision = int(a_investigar["tiene_comision"].sum())
+        st.warning(f"{len(a_investigar)} operaciones requieren revisión "
+                   f"({n_comision} con comisión).")
         st.dataframe(a_investigar)
         st.download_button("📥 Descargar 'A investigar' (.csv)", generar_csv(a_investigar),
                            file_name=f"a_investigar_{codigo}.csv", mime="text/csv")
