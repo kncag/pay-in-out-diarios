@@ -7,9 +7,7 @@ st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄"
 
 TOLERANCIA_MONTO = 0.01
 
-# IDs y códigos largos: se leen como texto. No son cantidades y, si pandas los
-# interpreta como número, desbordan int64 (rompen Arrow al mostrar la tabla) y
-# pueden perder precisión en el match contra el TXT.
+# IDs largos como texto: no son cantidades y desbordan int64 si se leen como número.
 COLS_TEXTO = {
     "PPY_external_id": str,
     "Deuda_PspTin": str,
@@ -23,7 +21,6 @@ for k in ["resultado_detalle", "resultado_solo_metabase", "resultado_resumen", "
 
 
 def generate_session_id():
-    """Identificador único de la corrida (trazabilidad en pantalla)."""
     import random
     ts = datetime.now().strftime("%Y%m%d%H%M%S")
     rnd = "".join(str(random.randint(0, 9)) for _ in range(6))
@@ -31,15 +28,7 @@ def generate_session_id():
 
 
 def parsear_gmoney_qr(archivo):
-    """
-    Parsea el TXT QR de PayIns (RTPTXN...) de ancho fijo (200 chars/línea).
-
-    Offsets confirmados contra archivo real:
-      [42:57]   IMPORTE principal en céntimos, alineado a la derecha → /100
-      [57:73]   COMISIÓN en céntimos con signo '+' (vacío si no aplica) → /100
-      [117:145] ID transacción de 28 dígitos → KEY (== PPY_external_id del CSV)
-      [152:163] estado (ej. '490000A0922'); letra A/R
-    """
+    """Parsea el TXT QR de PayIns (RTPTXN...) de ancho fijo (200 chars/línea)."""
     contenido = archivo.read().decode("latin-1")
     archivo.seek(0)
 
@@ -47,7 +36,6 @@ def parsear_gmoney_qr(archivo):
     for linea in contenido.splitlines():
         if len(linea) < 163:
             continue
-
         importe_str        = linea[42:57].strip()
         comision_str       = linea[57:73].strip().rstrip("+")
         id_transaccion_cce = linea[117:145].strip()
@@ -90,45 +78,49 @@ def parsear_gmoney_qr(archivo):
     ])
 
 
-def mapear_metabase_payin(df_metabase):
-    """Renombra columnas del CSV Metabase PayIns al esquema unificado."""
-    MAPA = {
-        "Comercio_Nombre":         "comercio_nombre",
-        "Deudor_Documento":        "deudor_documento",
-        "Deudor_Nombre":           "deudor_nombre",
-        "Deuda_public_id":         "deuda_id_interno",
-        "currency_code":           "currency_code",
-        "amount":                  "amount",
-        "Deuda_Estado":            "estado",
-        "PC_create_date_GMT_Peru": "fecha_operacion",
-        "PPY_external_id":         "id_operacion",
-    }
-    df = df_metabase.rename(columns=MAPA)
+# Mapeo único: CSV y Excel comparten los mismos nombres de columna planos.
+MAPA_METABASE = {
+    "Comercio_Nombre":         "comercio_nombre",
+    "Deudor_Documento":        "deudor_documento",
+    "Deudor_Nombre":           "deudor_nombre",
+    "amount":                  "amount",
+    "Deuda_Estado":            "estado",
+    "PC_create_date_GMT_Peru": "fecha_operacion",
+    "PPY_external_id":         "id_operacion",
+}
+COLUMNAS_SALIDA = ["id_operacion", "comercio_nombre", "deudor_documento",
+                   "deudor_nombre", "amount", "estado", "fecha_operacion"]
+
+
+def _normalizar_metabase(df):
+    """Renombra y tipa columnas al esquema unificado (CSV y Excel usan las mismas columnas)."""
+    df = df.rename(columns=MAPA_METABASE)
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
     df["fecha_operacion"] = pd.to_datetime(df["fecha_operacion"], errors="coerce", dayfirst=True)
-
-    columnas = [
-        "comercio_nombre", "deudor_documento", "deudor_nombre", "deuda_id_interno",
-        "currency_code", "amount", "estado", "fecha_operacion", "id_operacion",
-    ]
-    return df[[c for c in columnas if c in df.columns]]
+    df["id_operacion"] = df["id_operacion"].astype(str).str.strip()
+    return df[[c for c in COLUMNAS_SALIDA if c in df.columns]]
 
 
-def conciliar_qr(df_metabase_mapeado, df_gmoney, tolerancia=TOLERANCIA_MONTO):
+def cargar_metabase(archivos):
     """
-    Concilia desde el TXT GMoney como fuente de verdad (left join).
-    El CSV de Metabase trae de más (todos los canales); solo interesa
-    verificar que cada operación del TXT esté en el CSV.
-
-    Categorías:
-      OK                       - TXT aprobada + en CSV, monto principal cuadra
-      Diferencia de monto      - TXT aprobada + en CSV, monto principal distinto
-      A investigar (falta CSV) - TXT APROBADA pero NO en CSV  ← hallazgo clave
-      Rechazada (R)            - TXT estado R (no en CSV, esperado)
-
-    Retorna (df_detalle, df_solo_metabase, resumen).
+    Acepta CSV plano o Excel de deudas pagadas. Ambos traen las mismas columnas
+    planas (incluida PPY_external_id como key y amount como monto), así que se
+    normalizan igual. La columna JSON del Excel (PC_OP_metadata) no se usa.
     """
-    df_met = df_metabase_mapeado.copy()
+    dfs = []
+    for a in archivos:
+        nombre = a.name.lower()
+        if nombre.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(a, dtype=COLS_TEXTO)
+        else:
+            df = pd.read_csv(a, dtype=COLS_TEXTO, encoding="latin-1")
+        dfs.append(_normalizar_metabase(df))
+    return pd.concat(dfs, ignore_index=True) if dfs else None
+
+
+def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
+    """Concilia desde el TXT GMoney como fuente de verdad (left join)."""
+    df_met = df_metabase.copy()
     df_met["join_key"] = df_met["id_operacion"].astype(str).str.strip()
 
     df_gm = df_gmoney.copy()
@@ -146,7 +138,7 @@ def conciliar_qr(df_metabase_mapeado, df_gmoney, tolerancia=TOLERANCIA_MONTO):
         if row["estado_ar"] == "R":
             return "Rechazada (R)"
         if pd.isna(row["amount"]):
-            return "A investigar (falta en CSV)"
+            return "A investigar (falta en Metabase)"
         if abs(row["amount"] - row["monto_gmoney"]) <= tolerancia:
             return "OK"
         return "Diferencia de monto"
@@ -154,10 +146,7 @@ def conciliar_qr(df_metabase_mapeado, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     merged["dif_monto"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
     merged["resultado"] = merged.apply(_resultado, axis=1)
 
-    df_detalle = merged.rename(columns={
-        "join_key": "id_operacion",
-        "amount":   "monto_metabase",
-    })
+    df_detalle = merged.rename(columns={"join_key": "id_operacion", "amount": "monto_metabase"})
     columnas = [
         "id_operacion", "estado_ar", "resultado",
         "monto_gmoney", "monto_metabase", "dif_monto", "comision_gmoney",
@@ -173,12 +162,10 @@ def conciliar_qr(df_metabase_mapeado, df_gmoney, tolerancia=TOLERANCIA_MONTO):
 
     resumen = df_detalle["resultado"].value_counts().to_dict()
     resumen["Solo en Metabase (informativo)"] = len(df_solo_metabase)
-
     return df_detalle, df_solo_metabase, resumen
 
 
 def generar_csv(df):
-    """DataFrame a bytes CSV (sin dependencias externas; utf-8-sig para tildes en Excel)."""
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
@@ -186,7 +173,7 @@ def generar_csv(df):
 # UI
 # -----------------------
 st.title("📄 Conciliación Diaria — GMoney (Local)")
-st.caption("Conciliación 100% local — no depende de Supabase ni de n8n.")
+st.caption("Conciliación 100% local. Acepta el CSV o el Excel de deudas pagadas — la misma información.")
 st.divider()
 
 st.header("Subir archivos")
@@ -194,7 +181,7 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("Metabase")
     archivo_metabase = st.file_uploader(
-        "Archivo operaciones día anterior", type=["xlsx", "csv"],
+        "CSV o Excel de deudas pagadas", type=["xlsx", "xls", "csv"],
         accept_multiple_files=True, key="uploader_metabase"
     )
 with col2:
@@ -202,12 +189,7 @@ with col2:
     archivo_gmoney = st.file_uploader("Archivo txt GMoney", type=["txt"], key="uploader_gmoney")
 st.divider()
 
-df_metabase = None
-if archivo_metabase:  # lista no vacía
-    dfs = [pd.read_csv(a, dtype=COLS_TEXTO, encoding="latin-1") for a in archivo_metabase]
-    if dfs:
-        df_metabase = pd.concat(dfs, ignore_index=True)
-
+df_metabase = cargar_metabase(archivo_metabase) if archivo_metabase else None
 archivos_listos = df_metabase is not None and archivo_gmoney is not None
 
 if st.button("Conciliar", disabled=not archivos_listos, type="primary", width="stretch"):
@@ -220,9 +202,7 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary", width="s
             st.stop()
 
         with st.spinner("Conciliando localmente..."):
-            df_detalle, df_solo_metabase, resumen = conciliar_qr(
-                mapear_metabase_payin(df_metabase), df_gmoney
-            )
+            df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
 
         st.session_state.resultado_detalle       = df_detalle
         st.session_state.resultado_solo_metabase  = df_solo_metabase
@@ -248,32 +228,27 @@ if st.session_state.resultado_detalle is not None:
     st.write({k: int(v) for k, v in resumen.items()})
 
     a_investigar = df_detalle[df_detalle["resultado"].isin(
-        ["A investigar (falta en CSV)", "Diferencia de monto"]
+        ["A investigar (falta en Metabase)", "Diferencia de monto"]
     )]
     st.divider()
     st.subheader("⚠️ Operaciones a investigar")
-    st.write("Operaciones aprobadas del TXT que faltan en el CSV o tienen monto principal distinto.")
+    st.write("Operaciones aprobadas del TXT que faltan en Metabase o tienen monto principal distinto.")
     if a_investigar.empty:
-        st.success("No hay operaciones a investigar. Todo lo aprobado del TXT está en el CSV y cuadra.")
+        st.success("No hay operaciones a investigar.")
     else:
         st.warning(f"{len(a_investigar)} operaciones requieren revisión.")
         st.dataframe(a_investigar, width="stretch")
-        st.download_button(
-            "📥 Descargar 'A investigar' (.csv)", generar_csv(a_investigar),
-            file_name=f"a_investigar_{codigo}.csv", mime="text/csv",
-        )
+        st.download_button("📥 Descargar 'A investigar' (.csv)", generar_csv(a_investigar),
+                           file_name=f"a_investigar_{codigo}.csv", mime="text/csv")
 
     st.divider()
     st.subheader("Detalle completo (operaciones del TXT)")
     st.dataframe(df_detalle, width="stretch")
-    st.download_button(
-        "📥 Descargar detalle completo (.csv)", generar_csv(df_detalle),
-        file_name=f"conciliacion_detalle_{codigo}.csv", mime="text/csv",
-    )
+    st.download_button("📥 Descargar detalle completo (.csv)", generar_csv(df_detalle),
+                       file_name=f"conciliacion_detalle_{codigo}.csv", mime="text/csv")
 
     st.divider()
     st.subheader("Informativo — Solo en Metabase (no investigar)")
-    st.write(f"{len(df_solo_metabase)} operaciones están en el CSV pero no en el TXT QR. "
-             "Es esperado: el CSV incluye otros canales. No requieren acción.")
+    st.write(f"{len(df_solo_metabase)} operaciones están en Metabase pero no en el TXT QR.")
     with st.expander("Ver operaciones solo en Metabase"):
         st.dataframe(df_solo_metabase, width="stretch")
