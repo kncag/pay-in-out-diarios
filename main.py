@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+import json
 import re
 
 st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="centered")
@@ -26,11 +27,14 @@ MAPA_METABASE = {
 COLUMNAS_SALIDA = ["id_operacion", "comercio_nombre", "deudor_documento",
                    "deudor_nombre", "amount", "estado", "fecha_operacion"]
 
+CLAVES_ANOMALAS = {"clave", "code", "reason"}
+
 _DEFAULTS = {
     "resultado_detalle": None,
     "resultado_solo_metabase": None,
     "resultado_resumen": None,
     "codigo_conciliacion": None,
+    "json_anomalos": None,
     "ver_detalle": False,
     "ver_solo_metabase": False,
 }
@@ -119,12 +123,56 @@ def cargar_metabase(archivos):
     """Acepta CSV o Excel de deudas pagadas; ambos traen las mismas columnas planas."""
     dfs = []
     for a in archivos:
+        a.seek(0)
         if a.name.lower().endswith((".xlsx", ".xls")):
             df = pd.read_excel(a, dtype=COLS_TEXTO)
         else:
             df = pd.read_csv(a, dtype=COLS_TEXTO, encoding="latin-1")
+        a.seek(0)
         dfs.append(_normalizar_metabase(df))
     return pd.concat(dfs, ignore_index=True) if dfs else None
+
+
+def detectar_json_anomalos(archivos):
+    """
+    Relee la columna PC_OP_metadata y detecta filas cuyo JSON contiene
+    alguna de las claves anómalas (clave, code, reason).
+    Devuelve un DataFrame con las filas detectadas.
+    """
+    frames = []
+    for a in archivos:
+        a.seek(0)
+        if a.name.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(a, dtype={"PPY_external_id": str})
+        else:
+            df = pd.read_csv(a, dtype={"PPY_external_id": str}, encoding="latin-1")
+        a.seek(0)
+
+        if "PC_OP_metadata" not in df.columns:
+            continue
+
+        detectadas = []
+        for _, row in df.iterrows():
+            celda = str(row.get("PC_OP_metadata", "")).strip()
+            if not celda.startswith("{"):
+                continue
+            try:
+                d = json.loads(celda)
+            except json.JSONDecodeError:
+                continue
+            presentes = CLAVES_ANOMALAS & set(d.keys())
+            if presentes:
+                detectadas.append({
+                    "id_operacion":       str(row.get("PPY_external_id", "")).strip(),
+                    "claves_encontradas": ", ".join(sorted(presentes)),
+                    "contenido_json":     celda,
+                })
+        if detectadas:
+            frames.append(pd.DataFrame(detectadas))
+
+    if not frames:
+        return pd.DataFrame(columns=["id_operacion", "claves_encontradas", "contenido_json"])
+    return pd.concat(frames, ignore_index=True)
 
 
 def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
@@ -154,7 +202,6 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
 
     merged["dif_monto"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
     merged["resultado"] = merged.apply(_resultado, axis=1)
-
     merged["tiene_comision"] = merged["comision_gmoney"].fillna(0) > 0
 
     df_detalle = merged.rename(columns={"join_key": "id_operacion", "amount": "monto_metabase"})
@@ -224,10 +271,12 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
 
         with st.spinner("Procesando conciliación..."):
             df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
+            json_anom = detectar_json_anomalos(archivo_metabase)
 
         st.session_state.resultado_detalle       = df_detalle
         st.session_state.resultado_solo_metabase  = df_solo_metabase
         st.session_state.resultado_resumen        = resumen
+        st.session_state.json_anomalos            = json_anom
         st.session_state.codigo_conciliacion      = codigo
         st.session_state.ver_detalle              = False
         st.session_state.ver_solo_metabase        = False
@@ -243,10 +292,10 @@ if st.session_state.resultado_detalle is not None:
     df_detalle       = st.session_state.resultado_detalle
     df_solo_metabase = st.session_state.resultado_solo_metabase
     resumen          = st.session_state.resultado_resumen
+    json_anom        = st.session_state.json_anomalos
     codigo           = st.session_state.codigo_conciliacion
 
     st.divider()
-    st.caption(f"Código de conciliación: {codigo}")
 
     # --- Totales de entrada ---
     st.subheader("Totales de entrada")
@@ -276,6 +325,18 @@ if st.session_state.resultado_detalle is not None:
     st.table(df_cuadre)
     if not cuadre["cuadra"]:
         st.error("La suma de categorías no coincide con el total de líneas del TXT. Requiere revisión.")
+
+    # --- Metadata con estructura anómala ---
+    st.subheader("Metadata con estructura anómala")
+    st.write("Operaciones cuyo campo PC_OP_metadata contiene las claves 'clave', 'code' o 'reason', "
+             "en lugar de la estructura estándar de una operación QR.")
+    if json_anom is None or json_anom.empty:
+        st.info("No se detectaron registros con metadata anómala.")
+    else:
+        st.write(f"Total: {len(json_anom)} registros.")
+        st.dataframe(json_anom)
+        st.download_button("Descargar metadata anómala (CSV)", generar_csv(json_anom),
+                           file_name=f"metadata_anomala_{codigo}.csv", mime="text/csv")
 
     # --- Operaciones a investigar ---
     st.subheader("Operaciones a investigar")
