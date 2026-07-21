@@ -201,7 +201,7 @@ COLS_TEXTO = {
 
 df_metabase = None
 if archivo_metabase:  # lista no vacía
-    dfs = [pd.read_csv(a, dtype=COLS_TEXTO) for a in archivo_metabase]
+    dfs = [pd.read_csv(a, dtype=COLS_TEXTO, encoding="latin-1") for a in archivo_metabase]
     if dfs:
         df_metabase = pd.concat(dfs, ignore_index=True)
 
