@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 import re
 
-st.set_page_config(page_title="Conciliación Diaria — Local", page_icon="📄", layout="centered")
+st.set_page_config(page_title="Conciliación Diaria — Local", layout="centered")
 
 TOLERANCIA_MONTO = 0.01
 
@@ -51,7 +51,7 @@ def generate_session_id():
 
 
 def parsear_gmoney_qr(archivo):
-    """Parsea el TXT QR de PayIns (RTPTXN...) de ancho fijo (200 chars/línea)."""
+    """Parsea un TXT QR de PayIns (RTPTXN...) de ancho fijo (200 chars/línea)."""
     contenido = archivo.read().decode("latin-1")
     archivo.seek(0)
 
@@ -99,6 +99,16 @@ def parsear_gmoney_qr(archivo):
         "id_transaccion_cce", "estado_ar", "monto_gmoney",
         "comision_gmoney", "fecha_gmoney", "hora_completa"
     ])
+
+
+def parsear_gmoney_multiple(archivos):
+    """Parsea uno o varios TXT GMoney y los combina en un solo DataFrame."""
+    dfs = []
+    for a in archivos:
+        a.seek(0)
+        dfs.append(parsear_gmoney_qr(a))
+        a.seek(0)
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
 def _normalizar_metabase(df):
@@ -254,19 +264,21 @@ archivo_metabase = st.file_uploader(
     "Metabase — CSV o Excel de deudas pagadas", type=["xlsx", "xls", "csv"],
     accept_multiple_files=True, key="uploader_metabase"
 )
-archivo_gmoney = st.file_uploader("GMoney — archivo TXT", type=["txt"], key="uploader_gmoney")
+archivo_gmoney = st.file_uploader(
+    "GMoney — archivo(s) TXT", type=["txt"],
+    accept_multiple_files=True, key="uploader_gmoney"
+)
 st.divider()
 
 df_metabase = cargar_metabase(archivo_metabase) if archivo_metabase else None
-archivos_listos = df_metabase is not None and archivo_gmoney is not None
+archivos_listos = df_metabase is not None and bool(archivo_gmoney)
 
 if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
     codigo = generate_session_id()
     try:
-        archivo_gmoney.seek(0)
-        df_gmoney = parsear_gmoney_qr(archivo_gmoney)
+        df_gmoney = parsear_gmoney_multiple(archivo_gmoney)
         if df_gmoney.empty:
-            st.error("El archivo GMoney no contiene registros válidos.")
+            st.error("El/los archivo(s) GMoney no contienen registros válidos.")
             st.stop()
 
         with st.spinner("Procesando conciliación..."):
