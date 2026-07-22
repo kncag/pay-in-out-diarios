@@ -16,19 +16,35 @@ COLS_TEXTO = {
     "Deuda_PspTin": str,
     "Deuda_public_id": str,
     "Deudor_Documento": str,
+    "numero_operacion": str,
+    "numero_documento": str,
+    "codigo_kashio": str,
 }
 
-MAPA_METABASE = {
-    "Comercio_Nombre":         "comercio_nombre",
-    "Deudor_Documento":        "deudor_documento",
-    "Deudor_Nombre":           "deudor_nombre",
-    "amount":                  "amount",
-    "Deuda_Estado":            "estado",
-    "PC_create_date_GMT_Peru": "fecha_operacion",
-    "PPY_external_id":         "id_operacion",
+# Mapeo de columnas del CSV al esquema unificado, según el flujo.
+# id_operacion = key de match ; amount = monto principal.
+MAPEOS = {
+    "PayIns (QR / deudas pagadas)": {
+        "Comercio_Nombre":         "comercio_nombre",
+        "Deudor_Documento":        "deudor_documento",
+        "Deudor_Nombre":           "deudor_nombre",
+        "amount":                  "amount",
+        "Deuda_Estado":            "estado",
+        "PC_create_date_GMT_Peru": "fecha_operacion",
+        "PPY_external_id":         "id_operacion",
+    },
+    "PayOut (instant payouts)": {
+        "cus_name":                  "comercio_nombre",
+        "numero_documento":          "deudor_documento",
+        "total":                     "amount",
+        "estado":                    "estado",
+        "creacion_deuda_fecha_peru": "fecha_operacion",
+        "numero_operacion":          "id_operacion",
+        "comision":                  "comision_metabase",
+    },
 }
 COLUMNAS_SALIDA = ["id_operacion", "comercio_nombre", "deudor_documento",
-                   "deudor_nombre", "amount", "estado", "fecha_operacion"]
+                   "deudor_nombre", "amount", "estado", "fecha_operacion", "comision_metabase"]
 
 CLAVES_ANOMALAS = {"clave", "code", "reason"}
 
@@ -53,7 +69,7 @@ def generate_session_id():
 
 
 def _leer_archivo(archivo):
-    """Lee un CSV o Excel de Metabase a DataFrame crudo (una sola lectura)."""
+    """Lee un CSV o Excel a DataFrame crudo (una sola lectura)."""
     archivo.seek(0)
     if archivo.name.lower().endswith((".xlsx", ".xls")):
         df = pd.read_excel(archivo, dtype=COLS_TEXTO)
@@ -64,7 +80,7 @@ def _leer_archivo(archivo):
 
 
 def parsear_gmoney_qr(archivo):
-    """Parsea un TXT QR de PayIns (RTPTXN...) de ancho fijo (200 chars/línea)."""
+    """Parsea un TXT GMoney (RTPTXN...) de ancho fijo (200 chars/línea). Igual para QR y SOURCE."""
     contenido = archivo.read().decode("latin-1")
     archivo.seek(0)
 
@@ -120,11 +136,13 @@ def parsear_gmoney_multiple(archivos):
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def _normalizar_metabase(df):
-    """Renombra y tipa columnas al esquema unificado. Falla claro si faltan las críticas."""
-    df = df.rename(columns=MAPA_METABASE)
+def _normalizar_metabase(df, mapa):
+    """Renombra y tipa columnas al esquema unificado según el mapeo del flujo elegido."""
+    df = df.rename(columns=mapa)
     if "amount" in df.columns:
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    if "comision_metabase" in df.columns:
+        df["comision_metabase"] = pd.to_numeric(df["comision_metabase"], errors="coerce")
     if "fecha_operacion" in df.columns:
         df["fecha_operacion"] = pd.to_datetime(df["fecha_operacion"], errors="coerce", dayfirst=True)
     if "id_operacion" in df.columns:
@@ -132,17 +150,14 @@ def _normalizar_metabase(df):
 
     faltantes = [c for c in ["id_operacion", "amount"] if c not in df.columns]
     if faltantes:
-        st.error(f"Al archivo le faltan columnas críticas: {faltantes}. "
+        st.error(f"Al archivo le faltan columnas críticas para este flujo: {faltantes}. "
                  f"Columnas encontradas: {list(df.columns)}")
         st.stop()
     return df[[c for c in COLUMNAS_SALIDA if c in df.columns]]
 
 
 def _marcar_anomalos_metadata(df_crudo):
-    """
-    Detecta filas con PC_OP_metadata anómala (clave/code/reason).
-    Devuelve el subconjunto de df_crudo con esas filas.
-    """
+    """Detecta filas con PC_OP_metadata anómala (clave/code/reason)."""
     if "PC_OP_metadata" not in df_crudo.columns:
         return df_crudo.iloc[0:0].copy()
 
@@ -166,30 +181,28 @@ def _marcar_anomalos_metadata(df_crudo):
     return df_crudo.loc[indices].copy()
 
 
-def procesar_metabase(archivos):
+def procesar_metabase(archivos, mapa, col_id_original):
     """
     Lee cada archivo UNA sola vez y devuelve:
-      - df_metabase: normalizado para conciliar (incluye TODAS las filas)
-      - df_anomalos: filas completas anómalas para mostrar/descargar, con columna 'motivo'
-                     (metadata anómala y/o id duplicado en Metabase)
+      - df_metabase: normalizado para conciliar
+      - df_anomalos: filas anómalas (metadata clave/code/reason y/o id duplicado), con 'motivo'
+    col_id_original: nombre de la columna key en el CSV crudo (para detectar duplicados).
     """
     crudos, normalizados, anomalos_meta = [], [], []
     for a in archivos:
         crudo = _leer_archivo(a)
         crudos.append(crudo)
-        normalizados.append(_normalizar_metabase(crudo))
+        normalizados.append(_normalizar_metabase(crudo, mapa))
         anomalos_meta.append(_marcar_anomalos_metadata(crudo))
 
     df_metabase = pd.concat(normalizados, ignore_index=True) if normalizados else None
     df_crudo_total = pd.concat(crudos, ignore_index=True) if crudos else pd.DataFrame()
 
-    # Filas con metadata anómala
     df_meta = pd.concat(anomalos_meta, ignore_index=True) if anomalos_meta else pd.DataFrame()
 
-    # Filas de ids duplicados en Metabase (sobre el total combinado)
     df_dup = pd.DataFrame()
-    if "PPY_external_id" in df_crudo_total.columns and not df_crudo_total.empty:
-        ids = df_crudo_total["PPY_external_id"].astype(str).str.strip()
+    if col_id_original in df_crudo_total.columns and not df_crudo_total.empty:
+        ids = df_crudo_total[col_id_original].astype(str).str.strip()
         conteo = ids.value_counts()
         ids_dup = set(conteo[conteo > 1].index)
         if ids_dup:
@@ -208,8 +221,7 @@ def procesar_metabase(archivos):
         df_anomalos = pd.DataFrame()
     else:
         df_anomalos = pd.concat(partes, ignore_index=True)
-        # consolidar filas que caen en ambos motivos, usando PPY_external_id + PC_public_id como clave
-        claves = [c for c in ["PPY_external_id", "PC_public_id", "Deuda_public_id"]
+        claves = [c for c in [col_id_original, "PC_public_id", "Deuda_public_id"]
                   if c in df_anomalos.columns]
         if claves:
             df_anomalos["motivo"] = (
@@ -226,7 +238,6 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     df_met = df_metabase.copy()
     df_met["join_key"] = df_met["id_operacion"].astype(str).str.strip()
 
-    # IDs que aparecen 2+ veces en Metabase = duplicados indebidos (descuadran el merge)
     conteo_ids = df_met["join_key"].value_counts()
     ids_duplicados = set(conteo_ids[conteo_ids > 1].index)
 
@@ -243,14 +254,13 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
 
     merged["_es_duplicado"] = merged["join_key"].isin(ids_duplicados)
 
-    # Clasificación vectorizada. El orden importa: la primera condición verdadera gana.
     cond = [
         merged["estado_ar"] == "R",
         merged["amount"].isna(),
         merged["_es_duplicado"],
         (merged["amount"] - merged["monto_gmoney"]).abs() <= tolerancia,
     ]
-    opciones = ["Rechazada (R)", "A investigar (falta en Metabase)", "Duplicado indebido", "OK"]
+    opciones = ["Rechazada (R)", "A investigar (falta en registro)", "Duplicado indebido", "OK"]
     merged["resultado"] = np.select(cond, opciones, default="Diferencia de monto")
 
     merged["dif_monto"] = (merged["amount"].fillna(0) - merged["monto_gmoney"].fillna(0)).round(2)
@@ -259,7 +269,7 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
     df_detalle = merged.rename(columns={"join_key": "id_operacion", "amount": "monto_metabase"})
     columnas = [
         "id_operacion", "estado_ar", "resultado", "tiene_comision",
-        "monto_gmoney", "monto_metabase", "dif_monto", "comision_gmoney",
+        "monto_gmoney", "monto_metabase", "dif_monto", "comision_gmoney", "comision_metabase",
         "fecha_gmoney_dt", "fecha_operacion", "comercio_nombre", "deudor_documento",
     ]
     df_detalle = df_detalle[[c for c in columnas if c in df_detalle.columns]].rename(columns={
@@ -277,10 +287,10 @@ def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
 
     resumen = {
         "entradas": {
-            "Líneas en TXT (GMoney)":          total_txt,
-            "  · Aprobadas (A)":               int((df_gm["estado_ar"] == "A").sum()),
-            "  · Rechazadas (R)":              int((df_gm["estado_ar"] == "R").sum()),
-            "Líneas en Metabase (CSV/Excel)":  len(df_met),
+            "Líneas en TXT (GMoney)":       total_txt,
+            "  · Aprobadas (A)":            int((df_gm["estado_ar"] == "A").sum()),
+            "  · Rechazadas (R)":           int((df_gm["estado_ar"] == "R").sum()),
+            "Líneas en registro (CSV/Excel)": len(df_met),
         },
         "categorias": {k: int(v) for k, v in por_categoria.items()},
         "solo_metabase": len(df_solo_metabase),
@@ -307,14 +317,12 @@ def generar_descarga(df):
 
 
 def boton_descarga(df, etiqueta, nombre_base, codigo):
-    """Botón de descarga con formato Excel/CSV automático."""
     datos, ext, mime = generar_descarga(df)
     st.download_button(f"{etiqueta} ({ext.upper()})", datos,
                        file_name=f"{nombre_base}_{codigo}.{ext}", mime=mime)
 
 
 def mostrar_seccion_tabla(df, descripcion, msg_vacio, etiqueta_descarga, nombre_archivo, codigo):
-    """Sección estándar: descripción + tabla + descarga, o mensaje si está vacía."""
     st.write(descripcion)
     if df is None or df.empty:
         st.info(msg_vacio)
@@ -328,12 +336,19 @@ def mostrar_seccion_tabla(df, descripcion, msg_vacio, etiqueta_descarga, nombre_
 # INTERFAZ
 # -----------------------
 st.title("Conciliación Diaria — GMoney")
-st.caption("Conciliación local de operaciones QR. Acepta el CSV o el Excel de deudas pagadas.")
+st.caption("Conciliación local de operaciones. El TXT de GMoney es la fuente de verdad.")
+st.divider()
+
+st.subheader("Tipo de conciliación")
+flujo = st.selectbox("Selecciona el flujo", list(MAPEOS.keys()))
+MAPA = MAPEOS[flujo]
+# nombre de la columna key en el CSV crudo (clave del mapeo cuyo valor es 'id_operacion')
+COL_ID_ORIGINAL = [orig for orig, dest in MAPA.items() if dest == "id_operacion"][0]
 st.divider()
 
 st.subheader("Carga de archivos")
 archivo_metabase = st.file_uploader(
-    "Metabase — CSV o Excel de deudas pagadas", type=["xlsx", "xls", "csv"],
+    "Registro Kashio — CSV o Excel", type=["xlsx", "xls", "csv"],
     accept_multiple_files=True, key="uploader_metabase"
 )
 archivo_gmoney = st.file_uploader(
@@ -353,7 +368,7 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
             st.stop()
 
         with st.spinner("Procesando conciliación..."):
-            df_metabase, df_anomalos = procesar_metabase(archivo_metabase)
+            df_metabase, df_anomalos = procesar_metabase(archivo_metabase, MAPA, COL_ID_ORIGINAL)
             df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
 
         st.session_state.resultado_detalle       = df_detalle
@@ -385,7 +400,7 @@ if st.session_state.resultado_detalle is not None:
 
     st.subheader("Desglose por categoría")
     st.table(pd.DataFrame([{"Categoría": k, "Operaciones": v} for k, v in resumen["categorias"].items()]))
-    st.caption(f"Solo en Metabase (informativo, no se analiza): {resumen['solo_metabase']} operaciones.")
+    st.caption(f"Solo en registro (informativo, no se analiza): {resumen['solo_metabase']} operaciones.")
 
     st.subheader("Verificación de cuadre")
     cuadre = resumen["cuadre_txt"]
@@ -396,40 +411,38 @@ if st.session_state.resultado_detalle is not None:
         {"Concepto": "Diferencia (suma - TXT)", "Valor": cuadre["diferencia"]},
         {"Concepto": "Estado",                  "Valor": "Cuadra" if cuadre["cuadra"] else "No cuadra"},
     ])
-    df_cuadre["Valor"] = df_cuadre["Valor"].astype(str)   # evita mezcla int/str que rompe Arrow
+    df_cuadre["Valor"] = df_cuadre["Valor"].astype(str)
     st.table(df_cuadre)
     if not cuadre["cuadra"]:
         if resumen["duplicados"] > 0:
             st.warning(
                 f"El descuadre de {cuadre['diferencia']} se explica por "
                 f"{resumen['duplicados']} pago(s) duplicado(s) indebido(s) "
-                "(mismo PPY_external_id repetido en Metabase)."
+                "(mismo id repetido en el registro)."
             )
         else:
             st.error("La suma de categorías no coincide con el total de líneas del TXT. Requiere revisión.")
 
-    # --- Metadata anómala y duplicados (vista resumida, descarga completa) ---
     st.subheader("Metadata con estructura anómala y duplicados")
-    st.write("Incluye operaciones con PC_OP_metadata anómala (clave/code/reason) y operaciones cuyo "
-             "PPY_external_id está duplicado en Metabase. La columna 'motivo' indica la razón. "
-             "Es un reporte independiente de la conciliación.")
+    st.write("Incluye operaciones con PC_OP_metadata anómala (clave/code/reason) y operaciones con "
+             "id duplicado en el registro. La columna 'motivo' indica la razón. Reporte independiente "
+             "de la conciliación.")
     if df_anomalos is None or df_anomalos.empty:
         st.info("No se detectaron registros anómalos ni duplicados.")
     else:
         st.write(f"Total: {len(df_anomalos)} registros.")
-        cols_vista = [c for c in ["PPY_external_id", "motivo", "PC_OP_metadata"] if c in df_anomalos.columns]
+        cols_vista = [c for c in [COL_ID_ORIGINAL, "motivo", "PC_OP_metadata"] if c in df_anomalos.columns]
         st.dataframe(df_anomalos[cols_vista] if cols_vista else df_anomalos)
         boton_descarga(df_anomalos, "Descargar registros completos", "anomalos_y_duplicados", codigo)
 
-    # --- Operaciones a investigar ---
     st.subheader("Operaciones a investigar")
 
     no_ok = df_detalle[df_detalle["resultado"].isin(
-        ["A investigar (falta en Metabase)", "Diferencia de monto"])]
+        ["A investigar (falta en registro)", "Diferencia de monto"])]
     st.markdown("**Operaciones con incidencia (resultado distinto de OK)**")
     mostrar_seccion_tabla(
         no_ok,
-        "Operaciones aprobadas que faltan en Metabase o tienen monto principal distinto.",
+        "Operaciones aprobadas del TXT que faltan en el registro o tienen monto principal distinto.",
         "No se identificaron operaciones con incidencia.",
         "Descargar operaciones con incidencia", "incidencias", codigo,
     )
@@ -443,7 +456,6 @@ if st.session_state.resultado_detalle is not None:
         "Descargar OK con comisión", "ok_con_comision", codigo,
     )
 
-    # --- Detalle completo (bajo demanda) ---
     st.subheader("Detalle completo de operaciones del TXT")
     if st.button("Generar detalle completo"):
         st.session_state.ver_detalle = True
@@ -451,12 +463,11 @@ if st.session_state.resultado_detalle is not None:
         st.dataframe(df_detalle)
         boton_descarga(df_detalle, "Descargar detalle completo", "conciliacion_detalle", codigo)
 
-    # --- Solo en Metabase (bajo demanda) ---
-    st.subheader("Operaciones solo en Metabase")
-    st.write(f"{len(df_solo_metabase)} operaciones registradas en Metabase que no figuran en el TXT. "
-             "Se listan con fines informativos y no forman parte del análisis.")
+    st.subheader("Operaciones solo en registro")
+    st.write(f"{len(df_solo_metabase)} operaciones en el registro Kashio que no figuran en el TXT. "
+             "Informativo, no forman parte del análisis.")
     if st.button("Generar listado"):
         st.session_state.ver_solo_metabase = True
     if st.session_state.ver_solo_metabase:
         st.dataframe(df_solo_metabase)
-        boton_descarga(df_solo_metabase, "Descargar solo en Metabase", "solo_metabase", codigo)
+        boton_descarga(df_solo_metabase, "Descargar solo en registro", "solo_registro", codigo)
