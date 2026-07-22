@@ -37,8 +37,7 @@ _DEFAULTS = {
     "resultado_solo_metabase": None,
     "resultado_resumen": None,
     "codigo_conciliacion": None,
-    "json_anomalos": None,
-    "json_anomalos_completo": None,
+    "df_anomalos": None,
     "ver_detalle": False,
     "ver_solo_metabase": False,
 }
@@ -139,30 +138,21 @@ def _normalizar_metabase(df):
     return df[[c for c in COLUMNAS_SALIDA if c in df.columns]]
 
 
-def _detectar_anomalos(df_crudo):
+def _marcar_anomalos_metadata(df_crudo):
     """
-    Detecta filas cuyo PC_OP_metadata contiene claves anómalas (clave/code/reason).
-    Devuelve (df_resumen, df_completo):
-      - df_resumen: 3 columnas para mostrar
-      - df_completo: filas completas del original para descargar
-    Vectorizado: filtra por texto antes de parsear JSON (solo parsea candidatas).
-    Nota: la metadata anómala es solo para reporte; NO define la categoría de conciliación.
+    Detecta filas con PC_OP_metadata anómala (clave/code/reason).
+    Devuelve el subconjunto de df_crudo con esas filas.
     """
-    cols_resumen = ["id_operacion", "claves_encontradas", "contenido_json"]
-    vacio_resumen = pd.DataFrame(columns=cols_resumen)
-    vacio_completo = df_crudo.iloc[0:0].copy()
-
     if "PC_OP_metadata" not in df_crudo.columns:
-        return vacio_resumen, vacio_completo
+        return df_crudo.iloc[0:0].copy()
 
     col = df_crudo["PC_OP_metadata"].astype(str)
     patron = "|".join(CLAVES_ANOMALAS)
     candidatas = df_crudo[col.str.contains(patron, na=False, regex=True)]
     if candidatas.empty:
-        return vacio_resumen, vacio_completo
+        return df_crudo.iloc[0:0].copy()
 
-    filas_resumen = []
-    indices_anomalos = []
+    indices = []
     for idx, row in candidatas.iterrows():
         celda = str(row.get("PC_OP_metadata", "")).strip()
         if not celda.startswith("{"):
@@ -171,40 +161,64 @@ def _detectar_anomalos(df_crudo):
             d = json.loads(celda)
         except json.JSONDecodeError:
             continue
-        presentes = CLAVES_ANOMALAS & set(d.keys())
-        if presentes:
-            indices_anomalos.append(idx)
-            filas_resumen.append({
-                "id_operacion":       str(row.get("PPY_external_id", "")).strip(),
-                "claves_encontradas": ", ".join(sorted(presentes)),
-                "contenido_json":     celda,
-            })
-
-    df_resumen = pd.DataFrame(filas_resumen, columns=cols_resumen)
-    df_completo = df_crudo.loc[indices_anomalos].copy()
-    return df_resumen, df_completo
+        if CLAVES_ANOMALAS & set(d.keys()):
+            indices.append(idx)
+    return df_crudo.loc[indices].copy()
 
 
 def procesar_metabase(archivos):
     """
     Lee cada archivo UNA sola vez y devuelve:
       - df_metabase: normalizado para conciliar (incluye TODAS las filas)
-      - df_anomalos_resumen: 3 columnas para mostrar
-      - df_anomalos_completo: filas completas del original para descargar
+      - df_anomalos: filas completas anómalas para mostrar/descargar, con columna 'motivo'
+                     (metadata anómala y/o id duplicado en Metabase)
     """
-    normalizados, resumenes, completos = [], [], []
+    crudos, normalizados, anomalos_meta = [], [], []
     for a in archivos:
         crudo = _leer_archivo(a)
-        res, comp = _detectar_anomalos(crudo)
+        crudos.append(crudo)
         normalizados.append(_normalizar_metabase(crudo))
-        resumenes.append(res)
-        completos.append(comp)
+        anomalos_meta.append(_marcar_anomalos_metadata(crudo))
 
     df_metabase = pd.concat(normalizados, ignore_index=True) if normalizados else None
-    df_res = (pd.concat(resumenes, ignore_index=True) if resumenes
-              else pd.DataFrame(columns=["id_operacion", "claves_encontradas", "contenido_json"]))
-    df_comp = pd.concat(completos, ignore_index=True) if completos else pd.DataFrame()
-    return df_metabase, df_res, df_comp
+    df_crudo_total = pd.concat(crudos, ignore_index=True) if crudos else pd.DataFrame()
+
+    # Filas con metadata anómala
+    df_meta = pd.concat(anomalos_meta, ignore_index=True) if anomalos_meta else pd.DataFrame()
+
+    # Filas de ids duplicados en Metabase (sobre el total combinado)
+    df_dup = pd.DataFrame()
+    if "PPY_external_id" in df_crudo_total.columns and not df_crudo_total.empty:
+        ids = df_crudo_total["PPY_external_id"].astype(str).str.strip()
+        conteo = ids.value_counts()
+        ids_dup = set(conteo[conteo > 1].index)
+        if ids_dup:
+            df_dup = df_crudo_total[ids.isin(ids_dup)].copy()
+
+    def _con_motivo(df, motivo):
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        d["motivo"] = motivo
+        return d
+
+    partes = [p for p in [_con_motivo(df_meta, "metadata anómala"),
+                          _con_motivo(df_dup, "id duplicado")] if not p.empty]
+    if not partes:
+        df_anomalos = pd.DataFrame()
+    else:
+        df_anomalos = pd.concat(partes, ignore_index=True)
+        # consolidar filas que caen en ambos motivos, usando PPY_external_id + PC_public_id como clave
+        claves = [c for c in ["PPY_external_id", "PC_public_id", "Deuda_public_id"]
+                  if c in df_anomalos.columns]
+        if claves:
+            df_anomalos["motivo"] = (
+                df_anomalos.groupby(claves, dropna=False)["motivo"]
+                .transform(lambda s: " + ".join(sorted(set(s))))
+            )
+            df_anomalos = df_anomalos.drop_duplicates(subset=claves).reset_index(drop=True)
+
+    return df_metabase, df_anomalos
 
 
 def conciliar_qr(df_metabase, df_gmoney, tolerancia=TOLERANCIA_MONTO):
@@ -339,14 +353,13 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
             st.stop()
 
         with st.spinner("Procesando conciliación..."):
-            df_metabase, json_anom, json_anom_completo = procesar_metabase(archivo_metabase)
+            df_metabase, df_anomalos = procesar_metabase(archivo_metabase)
             df_detalle, df_solo_metabase, resumen = conciliar_qr(df_metabase, df_gmoney)
 
         st.session_state.resultado_detalle       = df_detalle
         st.session_state.resultado_solo_metabase  = df_solo_metabase
         st.session_state.resultado_resumen        = resumen
-        st.session_state.json_anomalos            = json_anom
-        st.session_state.json_anomalos_completo   = json_anom_completo
+        st.session_state.df_anomalos              = df_anomalos
         st.session_state.codigo_conciliacion      = codigo
         st.session_state.ver_detalle              = False
         st.session_state.ver_solo_metabase        = False
@@ -359,12 +372,11 @@ if st.button("Conciliar", disabled=not archivos_listos, type="primary"):
         st.stop()
 
 if st.session_state.resultado_detalle is not None:
-    df_detalle         = st.session_state.resultado_detalle
-    df_solo_metabase   = st.session_state.resultado_solo_metabase
-    resumen            = st.session_state.resultado_resumen
-    json_anom          = st.session_state.json_anomalos
-    json_anom_completo = st.session_state.json_anomalos_completo
-    codigo             = st.session_state.codigo_conciliacion
+    df_detalle       = st.session_state.resultado_detalle
+    df_solo_metabase = st.session_state.resultado_solo_metabase
+    resumen          = st.session_state.resultado_resumen
+    df_anomalos      = st.session_state.df_anomalos
+    codigo           = st.session_state.codigo_conciliacion
 
     st.divider()
 
@@ -394,18 +406,18 @@ if st.session_state.resultado_detalle is not None:
         else:
             st.error("La suma de categorías no coincide con el total de líneas del TXT. Requiere revisión.")
 
-    # --- Metadata con estructura anómala (vista resumida, descarga completa) ---
-    st.subheader("Metadata con estructura anómala")
-    st.write("Operaciones cuyo campo PC_OP_metadata contiene las claves 'clave', 'code' o 'reason', "
-             "en lugar de la estructura estándar de una operación QR. Es un reporte independiente "
-             "de la conciliación.")
-    if json_anom is None or json_anom.empty:
-        st.info("No se detectaron registros con metadata anómala.")
+    # --- Metadata anómala y duplicados (vista resumida, descarga completa) ---
+    st.subheader("Metadata con estructura anómala y duplicados")
+    st.write("Incluye operaciones con PC_OP_metadata anómala (clave/code/reason) y operaciones cuyo "
+             "PPY_external_id está duplicado en Metabase. La columna 'motivo' indica la razón. "
+             "Es un reporte independiente de la conciliación.")
+    if df_anomalos is None or df_anomalos.empty:
+        st.info("No se detectaron registros anómalos ni duplicados.")
     else:
-        st.write(f"Total: {len(json_anom)} registros.")
-        st.dataframe(json_anom)
-        boton_descarga(json_anom_completo, "Descargar registros completos",
-                       "metadata_anomala_completo", codigo)
+        st.write(f"Total: {len(df_anomalos)} registros.")
+        cols_vista = [c for c in ["PPY_external_id", "motivo", "PC_OP_metadata"] if c in df_anomalos.columns]
+        st.dataframe(df_anomalos[cols_vista] if cols_vista else df_anomalos)
+        boton_descarga(df_anomalos, "Descargar registros completos", "anomalos_y_duplicados", codigo)
 
     # --- Operaciones a investigar ---
     st.subheader("Operaciones a investigar")
