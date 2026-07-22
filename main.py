@@ -389,13 +389,15 @@ if st.session_state.resultado_detalle is not None:
 
     st.subheader("Verificación de cuadre")
     cuadre = resumen["cuadre_txt"]
-    st.table(pd.DataFrame([
+    df_cuadre = pd.DataFrame([
         {"Concepto": "Suma de categorías",      "Valor": cuadre["suma"]},
         {"Concepto": "Total líneas TXT",        "Valor": cuadre["total"]},
         {"Concepto": "Duplicados indebidos",    "Valor": resumen["duplicados"]},
         {"Concepto": "Diferencia (suma - TXT)", "Valor": cuadre["diferencia"]},
         {"Concepto": "Estado",                  "Valor": "Cuadra" if cuadre["cuadra"] else "No cuadra"},
-    ]))
+    ])
+    df_cuadre["Valor"] = df_cuadre["Valor"].astype(str)   # evita mezcla int/str que rompe Arrow
+    st.table(df_cuadre)
     if not cuadre["cuadra"]:
         if resumen["duplicados"] > 0:
             st.warning(
